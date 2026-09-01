@@ -33,7 +33,8 @@ NODE_INSTALL_VERSION="${NODE_INSTALL_VERSION:-24}"
 NVM_VERSION="v0.40.1"
 REPO_URL="${DSH_INSTALLER_REPO:-https://github.com/ayushsuletiya/dsh-installer.git}"
 REPO_BRANCH="${DSH_INSTALLER_BRANCH:-main}"
-META_ADS_BRIDGE_URL="${META_ADS_BRIDGE_URL:-https://meta-ads.xovi.pro}"
+# Endpoints come from the secrets file, not from this repo — see ENDPOINT_KEYS.
+META_ADS_BRIDGE_URL="${META_ADS_BRIDGE_URL:-}"
 
 DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
 PROFILE_DIR="$DSH_HOME_DIR/profiles/web"
@@ -218,6 +219,16 @@ META_ADS_BRIDGE_TOKEN HOSTINGER_API_TOKEN HOSTINGER_MAIL_API_TOKEN"
 CRED_KEYS="TABITOKEN_API_KEY OMNIROUTER_API_KEY OPENROUTER_API_KEY NVIDIA_NIM_API_KEY \
 AGENTROUTER_API_KEY GEMINI_API_KEY ZAI_API_KEY QWEN_BRIDGE_KEY AGY_BRIDGE_KEY"
 ENV_KEYS="META_ADS_BRIDGE_TOKEN HOSTINGER_API_TOKEN HOSTINGER_MAIL_API_TOKEN"
+# Endpoints, not credentials: the addresses of your own gateways. They live in the
+# same file so one file carries a machine, and they are deliberately absent from
+# this repo so it can be public. A blank endpoint drops the routes that need it.
+#   TABITOKEN_BASE_URL   the Claude Opus gateway (drops the tabitoken provider)
+#   OMNIROUTE_BASE_URL   your OmniRoute /v1 (drops antigravity, qwen-omni, the
+#                        free pools and the Codex OAuth route)
+#   QWEN_OMNI_NODE_ID    OmniRoute's provider-node id that fronts the Qwen web
+#                        session; the model ids are "<node-id>/<model>"
+#   META_ADS_BRIDGE_URL  the Meta Ads MCP bridge origin (drops its three rows)
+ENDPOINT_KEYS="TABITOKEN_BASE_URL OMNIROUTE_BASE_URL QWEN_OMNI_NODE_ID META_ADS_BRIDGE_URL"
 
 # Read KEY=VALUE lines only; comments, blanks and unknown keys are ignored, and a
 # value is taken verbatim so a base64 token with '=' in it survives.
@@ -234,7 +245,7 @@ read_secret_file() {
   done < "$_file"
 }
 
-for k in $SECRET_KEYS; do eval "SECRET_$k=\"\""; done
+for k in $SECRET_KEYS $ENDPOINT_KEYS; do eval "SECRET_$k=\"\""; done
 
 if [ -f "$DSH_HOME_DIR/.env" ]; then
   read_secret_file "$DSH_HOME_DIR/.env"
@@ -246,7 +257,7 @@ if [ -n "$SECRETS_FILE" ]; then
   ok "loaded $SECRETS_FILE"
 fi
 # The environment beats both, so CI can pass secrets with no file on disk.
-for k in $SECRET_KEYS; do
+for k in $SECRET_KEYS $ENDPOINT_KEYS; do
   eval "_env=\${$k:-}"
   if [ -n "$_env" ]; then eval "SECRET_$k=\$_env"; fi
 done
@@ -288,9 +299,24 @@ backup() {
 run mkdir -p "$DSH_HOME_DIR/logs" "$PRESET_DIR" "$INSTALLER_HOME"
 
 backup "$DSH_HOME_DIR/settings.yaml"
-run cp "$SRC_DIR/payload/settings.template.yaml" "$DSH_HOME_DIR/settings.yaml"
+# settings.yaml is rendered, not copied: the gateway addresses live in the secrets
+# file, and a provider whose endpoint is blank is dropped rather than left pointing
+# at nothing.
+eval "DSHX_TABITOKEN_BASE_URL=\${SECRET_TABITOKEN_BASE_URL:-}"; export DSHX_TABITOKEN_BASE_URL
+eval "DSHX_OMNIROUTE_BASE_URL=\${SECRET_OMNIROUTE_BASE_URL:-}"; export DSHX_OMNIROUTE_BASE_URL
+eval "DSHX_QWEN_OMNI_NODE_ID=\${SECRET_QWEN_OMNI_NODE_ID:-}"; export DSHX_QWEN_OMNI_NODE_ID
+if [ "$DRY_RUN" = 0 ]; then
+  node "$SRC_DIR/tools/render.mjs" \
+    "$SRC_DIR/payload/settings.template.yaml" \
+    "$DSH_HOME_DIR/settings.yaml" >/dev/null || die "rendering settings.yaml failed"
+fi
 run chmod 600 "$DSH_HOME_DIR/settings.yaml"
-ok "settings.yaml — 11 providers, dark theme, opus-qwen as the session default"
+if [ "$DRY_RUN" = 0 ]; then
+  PROVIDER_COUNT="$(grep -cE '^    [a-z0-9-]+:$' "$DSH_HOME_DIR/settings.yaml" 2>/dev/null || echo '?')"
+else
+  PROVIDER_COUNT="?"
+fi
+ok "settings.yaml — $PROVIDER_COUNT providers, dark theme, opus-qwen as the session default"
 
 if [ "$DRY_RUN" = 0 ]; then
   backup "$DSH_HOME_DIR/.credentials.yaml"
@@ -348,7 +374,14 @@ DSHX_DSH_HOME="$DSH_HOME_DIR"; export DSHX_DSH_HOME
 DSHX_HOME="$HOME"; export DSHX_HOME
 DSHX_NODE="$NODE_BIN"; export DSHX_NODE
 eval "DSHX_META_ADS_BRIDGE_TOKEN=\${SECRET_META_ADS_BRIDGE_TOKEN:-}"; export DSHX_META_ADS_BRIDGE_TOKEN
-DSHX_META_ADS_BRIDGE_URL="$META_ADS_BRIDGE_URL"; export DSHX_META_ADS_BRIDGE_URL
+eval "DSHX_META_ADS_BRIDGE_URL=\${SECRET_META_ADS_BRIDGE_URL:-}"
+if [ -z "$DSHX_META_ADS_BRIDGE_URL" ]; then DSHX_META_ADS_BRIDGE_URL="$META_ADS_BRIDGE_URL"; fi
+export DSHX_META_ADS_BRIDGE_URL
+DSHX_META_ADS_ENABLED=""
+if [ -n "$DSHX_META_ADS_BRIDGE_TOKEN" ] && [ -n "$DSHX_META_ADS_BRIDGE_URL" ]; then
+  DSHX_META_ADS_ENABLED=1
+fi
+export DSHX_META_ADS_ENABLED
 eval "DSHX_HOSTINGER_API_TOKEN=\${SECRET_HOSTINGER_API_TOKEN:-}"; export DSHX_HOSTINGER_API_TOKEN
 eval "DSHX_HOSTINGER_MAIL_API_TOKEN=\${SECRET_HOSTINGER_MAIL_API_TOKEN:-}"; export DSHX_HOSTINGER_MAIL_API_TOKEN
 DSHX_HOSTINGER_DIR="$HOME/.hostinger-mcp"; export DSHX_HOSTINGER_DIR
@@ -376,7 +409,7 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 ok "cordis.patch.yml rendered for this machine"
 
-if [ -n "$DSHX_META_ADS_BRIDGE_TOKEN" ]; then ok "Meta Ads MCP: 3 rows enabled"; else info "Meta Ads MCP: skipped (no token)"; fi
+if [ -n "$DSHX_META_ADS_ENABLED" ]; then ok "Meta Ads MCP: 3 rows enabled"; else info "Meta Ads MCP: skipped (needs both META_ADS_BRIDGE_TOKEN and META_ADS_BRIDGE_URL)"; fi
 if [ -n "$DSHX_HOSTINGER_API_TOKEN" ]; then ok "Hostinger mail MCP: enabled"; else info "Hostinger mail MCP: skipped (no token)"; fi
 if [ -n "$DSHX_MULTILOGIN_DIR" ]; then ok "Multilogin MCP: enabled"; else info "Multilogin MCP: skipped (~/multilogin-mcp absent)"; fi
 info "UI Skills MCP: always on (keyless)"
@@ -422,6 +455,57 @@ else
   fi
 fi
 
+# ── 7b. AgentRouter loopback proxy ──────────────────────────────────────────
+
+# AgentRouter is a plain HTTPS API, but it 401s unless the request carries a
+# Claude-CLI User-Agent, and pi-ai overwrites a provider `headers:` User-Agent with
+# its own. So the route needs one 60-line loopback hop that rewrites that header.
+# It costs nothing when the key is absent — the provider is simply unusable until
+# a key is added, and the proxy sits idle.
+AR_DIR="$DSH_HOME_DIR/agentrouter-proxy"
+run mkdir -p "$AR_DIR"
+run cp "$SRC_DIR/payload/agentrouter-proxy/agentrouter-proxy.mjs" "$AR_DIR/agentrouter-proxy.mjs"
+
+if [ "$DRY_RUN" = 0 ]; then
+  if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:3081/ 2>/dev/null; then
+    ok "AgentRouter proxy already running on 127.0.0.1:3081"
+  else
+    if [ "$PLATFORM" = mac ]; then
+      AR_PLIST="$HOME/Library/LaunchAgents/com.dsh.agentrouter-proxy.plist"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat > "$AR_PLIST" <<ARPLI
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.dsh.agentrouter-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$NODE_BIN</string>
+    <string>$AR_DIR/agentrouter-proxy.mjs</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$DSH_HOME_DIR/logs/agentrouter-proxy.log</string>
+  <key>StandardErrorPath</key><string>$DSH_HOME_DIR/logs/agentrouter-proxy.log</string>
+</dict>
+</plist>
+ARPLI
+      if launchctl load -w "$AR_PLIST" >/dev/null 2>&1; then
+        ok "AgentRouter proxy LaunchAgent loaded"
+      else
+        nohup "$NODE_BIN" "$AR_DIR/agentrouter-proxy.mjs" \
+          >>"$DSH_HOME_DIR/logs/agentrouter-proxy.log" 2>&1 &
+        warn "launchctl refused the AgentRouter proxy; started detached (load $AR_PLIST from Terminal to persist)"
+      fi
+    else
+      nohup "$NODE_BIN" "$AR_DIR/agentrouter-proxy.mjs" \
+        >>"$DSH_HOME_DIR/logs/agentrouter-proxy.log" 2>&1 &
+      ok "AgentRouter proxy started (add it to your session autostart to persist)"
+    fi
+  fi
+fi
+
 # ── 8. Qwen desktop app + bridge ────────────────────────────────────────────
 
 step "Qwen desktop bridge"
@@ -431,7 +515,7 @@ if [ "$SKIP_QWEN" = 1 ]; then
 else
   run mkdir -p "$BRIDGE_DIR"
   for f in server-app.mjs qwen-app-client.mjs qwen-auth.mjs qwen-login.mjs \
-           server-oauth.mjs tool-formatter.mjs relay.mjs push-creds.mjs README.md run.sh run.ps1; do
+           server-oauth.mjs tool-formatter.mjs push-creds.mjs README.md run.sh run.ps1; do
     if [ -f "$SRC_DIR/payload/qwen-bridge/$f" ]; then
       run cp "$SRC_DIR/payload/qwen-bridge/$f" "$BRIDGE_DIR/$f"
     fi
@@ -540,7 +624,12 @@ if [ "$DRY_RUN" = 0 ]; then
     warn "settings.yaml failed its sanity check"; FAILED=1
   fi
 
-  if DSH_HOME="$DSH_HOME_DIR" dsh --profile web --dump-config >/tmp/dsh-dump-config.log 2>&1; then
+  # Composition needs the bundles on disk, so a deliberately skipped install is
+  # reported as skipped rather than as a failure.
+  if [ ! -d "$PROFILE_DIR/node_modules" ]; then
+    info "composition check skipped — bundles not installed yet"
+    info "run: dsh plugin --profile web install"
+  elif DSH_HOME="$DSH_HOME_DIR" dsh --profile web --dump-config >/tmp/dsh-dump-config.log 2>&1; then
     ROWS="$(grep -c '^- id:' /tmp/dsh-dump-config.log 2>/dev/null || echo '?')"
     ok "composed web profile parses ($ROWS top-level rows)"
   else

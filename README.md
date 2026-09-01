@@ -6,21 +6,34 @@ fresh **macOS** or **Windows** machine.
 
 ## Install
 
-**macOS / Linux**
+**macOS / Linux** — one command, no login:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayushsuletiya/dsh-installer/main/install.sh | bash -s -- --secrets ~/dsh-secrets.env
+```
+
+or from a clone:
 
 ```bash
 git clone https://github.com/ayushsuletiya/dsh-installer.git ~/dsh-installer
 cd ~/dsh-installer
-cp secrets.example.env ~/dsh-secrets.env   # fill in the keys you have
+cp secrets.example.env ~/dsh-secrets.env   # fill in the keys and endpoints you have
 ./install.sh --secrets ~/dsh-secrets.env
 ```
 
-**Windows 10/11** (PowerShell, no admin needed for the normal path)
+**Windows 10/11** — one command, no login, no admin for the normal path:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/ayushsuletiya/dsh-installer/main/install.ps1 -OutFile "$env:TEMP\dsh-install.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\dsh-install.ps1" -Secrets $HOME\dsh-secrets.env
+```
+
+or from a clone:
 
 ```powershell
 git clone https://github.com/ayushsuletiya/dsh-installer.git $HOME\dsh-installer
 cd $HOME\dsh-installer
-copy secrets.example.env $HOME\dsh-secrets.env   # fill in the keys you have
+copy secrets.example.env $HOME\dsh-secrets.env
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Secrets $HOME\dsh-secrets.env
 ```
 
@@ -41,10 +54,25 @@ Every step is idempotent — re-running is safe and only does what is missing. U
 | **Model picker** | search across provider/model/id + collapsible provider groups, folding persisted in localStorage |
 | **Qwen** | desktop app downloaded and installed automatically, plus the CDP bridge on `127.0.0.1:3083`, kept alive by a LaunchAgent (macOS) or logon Scheduled Task (Windows) |
 
-## Credentials
+## Credentials and endpoints
 
-Nothing is baked into the repo. Keys come from `--secrets <file>`, the environment,
-or an existing `~/.dsh/.env`, and land in `~/.dsh/.credentials.yaml` (owner-only).
+Nothing is baked into the repo — not the keys, and not the addresses of your own
+gateways. Both come from `--secrets <file>`, the environment, or an existing
+`~/.dsh/.env`; keys land in `~/.dsh/.credentials.yaml` (owner-only).
+
+That is why this repo can be public. The five endpoint values —
+`TABITOKEN_BASE_URL`, `OMNIROUTE_BASE_URL`, `QWEN_OMNI_NODE_ID`,
+`META_ADS_BRIDGE_URL`, `QWEN_RELAY_SSH` — live only in your secrets file, and a
+blank one silently drops the routes that need it rather than writing a provider
+that points at nothing:
+
+| blank | what disappears |
+| --- | --- |
+| `TABITOKEN_BASE_URL` | the Claude Opus 5/4.8 routes; the default session model falls back to Antigravity, then the local Qwen bridge |
+| `OMNIROUTE_BASE_URL` | Antigravity, Qwen-via-OmniRoute, the free pools, Codex OAuth |
+| `META_ADS_BRIDGE_URL` or its token | all three Meta Ads MCP rows |
+
+With every endpoint set you get 11 providers; with none, 6.
 
 Anything left blank simply switches that route off and the install still finishes.
 Add keys later without reinstalling:

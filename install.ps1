@@ -41,7 +41,8 @@ $NodeMajorMin       = 22
 $NodeInstallVersion = '24'
 $RepoUrl            = if ($env:DSH_INSTALLER_REPO)   { $env:DSH_INSTALLER_REPO }   else { 'https://github.com/ayushsuletiya/dsh-installer.git' }
 $RepoBranch         = if ($env:DSH_INSTALLER_BRANCH) { $env:DSH_INSTALLER_BRANCH } else { 'main' }
-$MetaAdsBridgeUrl   = if ($env:META_ADS_BRIDGE_URL)  { $env:META_ADS_BRIDGE_URL }  else { 'https://meta-ads.xovi.pro' }
+# Endpoints come from the secrets file, not from this repo - see $EndpointKeys.
+$MetaAdsBridgeUrl   = if ($env:META_ADS_BRIDGE_URL)  { $env:META_ADS_BRIDGE_URL }  else { '' }
 
 $UserHome     = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $DshHome      = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $UserHome '.dsh' }
@@ -204,9 +205,13 @@ $CredKeys = @(
   'AGENTROUTER_API_KEY','GEMINI_API_KEY','ZAI_API_KEY','QWEN_BRIDGE_KEY','AGY_BRIDGE_KEY'
 )
 $EnvKeys = @('META_ADS_BRIDGE_TOKEN','HOSTINGER_API_TOKEN','HOSTINGER_MAIL_API_TOKEN')
+# Endpoints, not credentials: the addresses of your own gateways. Same file, so one
+# file carries a machine; absent from the repo so it can be public. A blank
+# endpoint drops the routes that need it.
+$EndpointKeys = @('TABITOKEN_BASE_URL','OMNIROUTE_BASE_URL','QWEN_OMNI_NODE_ID','META_ADS_BRIDGE_URL','QWEN_RELAY_SSH')
 
 $Secret = @{}
-foreach ($k in $SecretKeys) { $Secret[$k] = '' }
+foreach ($k in ($SecretKeys + $EndpointKeys)) { $Secret[$k] = '' }
 
 function Read-SecretFile($path) {
   foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
@@ -230,7 +235,7 @@ if ($Secrets) {
   Read-SecretFile $Secrets
   Write-Ok "loaded $Secrets"
 }
-foreach ($k in $SecretKeys) {
+foreach ($k in ($SecretKeys + $EndpointKeys)) {
   $fromEnv = [Environment]::GetEnvironmentVariable($k)
   if ($fromEnv) { $Secret[$k] = $fromEnv }
 }
@@ -275,11 +280,21 @@ foreach ($d in @((Join-Path $DshHome 'logs'), $PresetDir, $InstallerHome, $Profi
 
 $settingsPath = Join-Path $DshHome 'settings.yaml'
 Backup-File $settingsPath
-Invoke-Step {
-  Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\settings.template.yaml') -Destination $settingsPath -Force
-} "copy settings.yaml"
+# settings.yaml is rendered, not copied: the gateway addresses live in the secrets
+# file, and a provider whose endpoint is blank is dropped rather than left pointing
+# at nothing.
+$env:DSHX_TABITOKEN_BASE_URL = $Secret['TABITOKEN_BASE_URL']
+$env:DSHX_OMNIROUTE_BASE_URL = $Secret['OMNIROUTE_BASE_URL']
+$env:DSHX_QWEN_OMNI_NODE_ID  = $Secret['QWEN_OMNI_NODE_ID']
+if (-not $DryRun) {
+  & node (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\settings.template.yaml') $settingsPath | Out-Null
+  if ($LASTEXITCODE -ne 0) { Die 'rendering settings.yaml failed' }
+}
 Protect-File $settingsPath
-Write-Ok 'settings.yaml - 11 providers, dark theme, opus-qwen as the session default'
+$providerCount = if ($DryRun) { '?' } else {
+  ([regex]::Matches((Get-Content -LiteralPath $settingsPath -Raw), '(?m)^    [a-z0-9-]+:$')).Count
+}
+Write-Ok "settings.yaml - $providerCount providers, dark theme, opus-qwen as the session default"
 
 $credPath = Join-Path $DshHome '.credentials.yaml'
 if (-not $DryRun) {
@@ -337,7 +352,8 @@ $env:DSHX_DSH_HOME    = ToFwd $DshHome
 $env:DSHX_HOME        = ToFwd $UserHome
 $env:DSHX_NODE        = ToFwd $NodeBin
 $env:DSHX_META_ADS_BRIDGE_TOKEN    = $Secret['META_ADS_BRIDGE_TOKEN']
-$env:DSHX_META_ADS_BRIDGE_URL      = $MetaAdsBridgeUrl
+$env:DSHX_META_ADS_BRIDGE_URL      = if ($Secret['META_ADS_BRIDGE_URL']) { $Secret['META_ADS_BRIDGE_URL'] } else { $MetaAdsBridgeUrl }
+$env:DSHX_META_ADS_ENABLED         = if ($Secret['META_ADS_BRIDGE_TOKEN'] -and $env:DSHX_META_ADS_BRIDGE_URL) { '1' } else { '' }
 $env:DSHX_HOSTINGER_API_TOKEN      = $Secret['HOSTINGER_API_TOKEN']
 $env:DSHX_HOSTINGER_MAIL_API_TOKEN = $Secret['HOSTINGER_MAIL_API_TOKEN']
 $hostingerDir = Join-Path $UserHome '.hostinger-mcp'
@@ -363,7 +379,7 @@ if (-not $DryRun) {
 }
 Write-Ok 'cordis.patch.yml rendered for this machine'
 
-if ($Secret['META_ADS_BRIDGE_TOKEN']) { Write-Ok 'Meta Ads MCP: 3 rows enabled' } else { Write-Info 'Meta Ads MCP: skipped (no token)' }
+if ($env:DSHX_META_ADS_ENABLED) { Write-Ok 'Meta Ads MCP: 3 rows enabled' } else { Write-Info 'Meta Ads MCP: skipped (needs both META_ADS_BRIDGE_TOKEN and META_ADS_BRIDGE_URL)' }
 if ($Secret['HOSTINGER_API_TOKEN'])   { Write-Ok 'Hostinger mail MCP: enabled' }   else { Write-Info 'Hostinger mail MCP: skipped (no token)' }
 if ($env:DSHX_MULTILOGIN_DIR)         { Write-Ok 'Multilogin MCP: enabled' }       else { Write-Info 'Multilogin MCP: skipped (multilogin-mcp absent)' }
 Write-Info 'UI Skills MCP: always on (keyless)'
@@ -410,6 +426,40 @@ if ($SkipPatch) {
   if ($LASTEXITCODE -eq 4) { Write-Warn 'model-picker patch skipped (the picker still works, without folding)' }
 }
 
+# ── 7b. AgentRouter loopback proxy ──────────────────────────────────────────
+
+# AgentRouter is a plain HTTPS API, but it 401s unless the request carries a
+# Claude-CLI User-Agent, and pi-ai overwrites a provider `headers:` User-Agent with
+# its own. So the route needs one 60-line loopback hop that rewrites that header.
+$ArDir = Join-Path $DshHome 'agentrouter-proxy'
+Invoke-Step { New-Item -ItemType Directory -Force -Path $ArDir | Out-Null } "mkdir $ArDir"
+Invoke-Step {
+  Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\agentrouter-proxy\agentrouter-proxy.mjs') -Destination (Join-Path $ArDir 'agentrouter-proxy.mjs') -Force
+} 'copy agentrouter-proxy.mjs'
+
+if (-not $DryRun) {
+  $arUp = $false
+  try { Invoke-WebRequest -Uri 'http://127.0.0.1:3081/' -TimeoutSec 3 -UseBasicParsing | Out-Null; $arUp = $true } catch {}
+  if ($arUp) {
+    Write-Ok 'AgentRouter proxy already running on 127.0.0.1:3081'
+  } else {
+    $arScript = Join-Path $ArDir 'agentrouter-proxy.mjs'
+    try {
+      $arAction = New-ScheduledTaskAction -Execute $NodeBin -Argument ('"{0}"' -f $arScript) -WorkingDirectory $ArDir
+      $arTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+      $arSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+      Register-ScheduledTask -TaskName 'DSH AgentRouter Proxy' -Action $arAction -Trigger $arTrigger `
+        -Settings $arSettings -Description 'Rewrites the User-Agent AgentRouter requires' -Force | Out-Null
+      Start-ScheduledTask -TaskName 'DSH AgentRouter Proxy'
+      Write-Ok 'AgentRouter proxy Scheduled Task registered'
+    } catch {
+      Start-Process $NodeBin -ArgumentList @($arScript) -WindowStyle Hidden
+      Write-Warn "could not register the AgentRouter task ($($_.Exception.Message)); started detached"
+    }
+  }
+}
+
 # ── 8. Qwen desktop app + bridge ────────────────────────────────────────────
 
 Write-Step 'Qwen desktop bridge'
@@ -419,7 +469,7 @@ if ($SkipQwen) {
 } else {
   Invoke-Step { New-Item -ItemType Directory -Force -Path $BridgeDir | Out-Null } "mkdir $BridgeDir"
   foreach ($f in @('server-app.mjs','qwen-app-client.mjs','qwen-auth.mjs','qwen-login.mjs',
-                   'server-oauth.mjs','tool-formatter.mjs','relay.mjs','push-creds.mjs',
+                   'server-oauth.mjs','tool-formatter.mjs','push-creds.mjs',
                    'README.md','run.sh','run.ps1')) {
     $srcFile = Join-Path $SrcDir "payload\qwen-bridge\$f"
     if (Test-Path -LiteralPath $srcFile) {
@@ -504,14 +554,21 @@ if (-not $DryRun) {
   elseif ($text -match 'opencode')  { Write-Warn 'opencode leaked into settings.yaml';    $script:Failed = 1 }
   else { Write-Ok 'settings.yaml sane - opencode fully removed' }
 
-  $dumpLog = Join-Path $env:TEMP 'dsh-dump-config.log'
-  $env:DSH_HOME = $DshHome
-  & dsh --profile web --dump-config *> $dumpLog
-  if ($LASTEXITCODE -eq 0) {
-    $rows = (Select-String -Path $dumpLog -Pattern '^- id:' -AllMatches).Count
-    Write-Ok "composed web profile parses ($rows top-level rows)"
+  # Composition needs the bundles on disk, so a deliberately skipped install is
+  # reported as skipped rather than as a failure.
+  if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'node_modules'))) {
+    Write-Info 'composition check skipped - bundles not installed yet'
+    Write-Info 'run: dsh plugin --profile web install'
   } else {
-    Write-Warn "profile composition failed - see $dumpLog"; $script:Failed = 1
+    $dumpLog = Join-Path $env:TEMP 'dsh-dump-config.log'
+    $env:DSH_HOME = $DshHome
+    & dsh --profile web --dump-config *> $dumpLog
+    if ($LASTEXITCODE -eq 0) {
+      $rows = (Select-String -Path $dumpLog -Pattern '^- id:' -AllMatches).Count
+      Write-Ok "composed web profile parses ($rows top-level rows)"
+    } else {
+      Write-Warn "profile composition failed - see $dumpLog"; $script:Failed = 1
+    }
   }
 
   if (-not $SkipQwen) {

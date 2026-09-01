@@ -44,7 +44,7 @@
         browserTimeoutMs: 45000
         logFile: !!js dshHomePath('logs', 'web-search-ddg.log')
 
-#if META_ADS_BRIDGE_TOKEN
+#if META_ADS_ENABLED
 # ── Meta Ads MCP (three rows off one bridge) ────────────────────────────────
 # Bridge: docker container meta-ads-mcp-bridge behind Traefik/TLS. It owns the
 # Facebook Login for Business PKCE flow, stores tokens chmod-600, refreshes

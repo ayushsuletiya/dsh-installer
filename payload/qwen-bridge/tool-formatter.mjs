@@ -20,7 +20,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 const HOME = os.homedir();
-const BASE_URL = process.env.QWEN_TOOLFMT_URL || "https://omni.theworldofmemories.in/v1";
+// Point QWEN_TOOLFMT_URL at your own OpenAI-compatible gateway to enable this.
+const BASE_URL = process.env.QWEN_TOOLFMT_URL || "";
 const MODEL = process.env.QWEN_TOOLFMT_MODEL || "openrouter/cohere/north-mini-code:free";
 // Tried in order when the primary is throttled; all verified to emit native tool_calls.
 const FALLBACKS = (process.env.QWEN_TOOLFMT_FALLBACKS ||

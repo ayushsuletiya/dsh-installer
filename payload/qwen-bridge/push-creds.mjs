@@ -17,7 +17,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 
 const CDP = Number(process.env.QWEN_CDP_PORT || 9222);
 const BRIDGE = process.env.QWEN_BRIDGE_URL || "http://127.0.0.1:3083";
-const VPS = process.env.QWEN_RELAY_SSH || "root@72.60.219.89";
+// Set QWEN_RELAY_SSH (user@host) to push a fresh signature to your own relay.
+const VPS = process.env.QWEN_RELAY_SSH || "";
 const RELAY = process.env.QWEN_RELAY_URL || "http://127.0.0.1:3099";
 const KEY_FILE = process.env.QWEN_RELAY_KEY_FILE
   || path.join(os.homedir(), "qwen-bridge", ".relay-key");
@@ -44,6 +45,10 @@ const log = (...a) => console.log(new Date().toISOString(), "[push-creds]", ...a
 // This whole script is OPTIONAL: it only keeps the VPS OmniRoute relay's Qwen
 // signature fresh. On a machine with no relay key configured there is nothing to
 // push, so exit quietly instead of crashing the supervisor loop every 30 min.
+if (!dry && !VPS) {
+  log("no QWEN_RELAY_SSH configured - skipping (local bridge is unaffected)");
+  process.exit(0);
+}
 if (!dry && !fs.existsSync(KEY_FILE)) {
   log("no relay key at", KEY_FILE, "- skipping (local bridge is unaffected)");
   process.exit(0);

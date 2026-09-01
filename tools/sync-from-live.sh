@@ -102,7 +102,7 @@ fi
 # path, an optional relay key), so only files WITHOUT those markers are refreshed
 # and anything already patched is reported instead of overwritten.
 for f in server-app.mjs qwen-app-client.mjs qwen-auth.mjs qwen-login.mjs \
-         server-oauth.mjs tool-formatter.mjs relay.mjs push-creds.mjs README.md; do
+         server-oauth.mjs tool-formatter.mjs push-creds.mjs README.md; do
   live="$BRIDGE_DIR/$f"
   mine="$PAYLOAD/qwen-bridge/$f"
   [ -f "$live" ] || continue

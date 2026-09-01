@@ -2,11 +2,12 @@ ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 llm-pi-ai:
   providers:
+#if TABITOKEN_BASE_URL
     tabitoken:
       displayName: TabiToken · Claude Opus
       apiKeyEnv: TABITOKEN_API_KEY
       api: anthropic-messages
-      baseURL: https://tabi.72-60-219-89.sslip.io
+      baseURL: {{TABITOKEN_BASE_URL}}
       models:
         - id: claude-opus-5-thinking
           name: Claude Opus 5 Thinking
@@ -44,12 +45,14 @@ llm-pi-ai:
           input: [ text, image ]
           compat:
             supportsTemperature: false
+#endif
 
+#if OMNIROUTE_BASE_URL
     antigravity:
       displayName: Antigravity · via OmniRoute
       apiKeyEnv: OMNIROUTER_API_KEY
       api: openai-completions
-      baseURL: https://omni.theworldofmemories.in/v1
+      baseURL: {{OMNIROUTE_BASE_URL}}
       # REWIRED 31 Aug 2026 — pure API key, NATIVE tool calling.
       #
       # Ayush connected both Antigravity accounts inside OmniRoute
@@ -218,7 +221,9 @@ llm-pi-ai:
           maxTokens: 32768
           input: [ text ]
           reasoningEfforts: false
+#endif
 
+#if OMNIROUTE_BASE_URL
     qwen-omni:
       displayName: Qwen · via OmniRoute (chat only · any machine)
       # CHAT ONLY, and this applies to the OmniRoute route ONLY — the local
@@ -231,20 +236,21 @@ llm-pi-ai:
       # group name is the only place this can be surfaced.
       apiKeyEnv: OMNIROUTER_API_KEY
       api: openai-completions
-      baseURL: https://omni.theworldofmemories.in/v1
+      baseURL: {{OMNIROUTE_BASE_URL}}
       # Same Qwen account, reached through the OmniRoute gateway instead of the
-      # local app: /opt/qwen-relay on the VPS holds the web session (cookie +
-      # bx-ua signature) and speaks OpenAI, registered in OmniRoute as the custom
-      # node `qwen` (provider node openai-compatible-chat-50e757e6…, connection
-      # e06a72f5…). Works from any machine and does not need the Mac app awake;
-      # the Mac pushes a fresh signature every 30 min via run.sh → push-creds.mjs.
+      # local app: a relay holds the web session (cookie + bx-ua signature) and
+      # speaks OpenAI, registered in OmniRoute as a custom openai-compatible-chat
+      # provider node — its id is QWEN_OMNI_NODE_ID in your secrets file. Works
+      # from any machine and does not need the desktop app awake; a machine that
+      # HAS the app can keep the signature fresh every 30 min via
+      # run.sh -> push-creds.mjs (set QWEN_RELAY_SSH).
       # PREFIX MATTERS, and it changed: `qwen/qwen3.8-max` now resolves to
       # OpenRouter's PAID catalog and dies with "[402] requires more credits"
       # (verified 31 Aug 2026). The web session is only reachable through the
       # provider-node id below. All six ids answered on it. Tool calling is
       # prompt-emulated on this route, so keep it for chat and reasoning.
       models:
-        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.8-max
+        - id: {{QWEN_OMNI_NODE_ID}}/qwen3.8-max
           name: Qwen3.8 Max · OmniRoute
           contextWindow: 1000000
           maxTokens: 65536
@@ -253,7 +259,7 @@ llm-pi-ai:
             "off":
             high: high
             max: max
-        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.7-plus
+        - id: {{QWEN_OMNI_NODE_ID}}/qwen3.7-plus
           name: Qwen3.7 Plus · OmniRoute
           contextWindow: 1000000
           maxTokens: 65536
@@ -262,7 +268,7 @@ llm-pi-ai:
             "off":
             high: high
             max: max
-        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.7-max
+        - id: {{QWEN_OMNI_NODE_ID}}/qwen3.7-max
           name: Qwen3.7 Max · OmniRoute
           contextWindow: 1000000
           maxTokens: 65536
@@ -271,12 +277,13 @@ llm-pi-ai:
             "off":
             high: high
             max: max
-        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.5-omni-plus
+        - id: {{QWEN_OMNI_NODE_ID}}/qwen3.5-omni-plus
           name: Qwen3.5 Omni Plus · OmniRoute
           contextWindow: 262144
           maxTokens: 65536
           input: [ text ]
           reasoningEfforts: false
+#endif
 
     qwen:
       displayName: Qwen · Desktop App (full tools · local bridge)
@@ -558,6 +565,17 @@ llm-pi-ai:
       apiKeyEnv: AGENTROUTER_API_KEY
       api: anthropic-messages
       baseURL: http://127.0.0.1:3081
+      # AgentRouter is a plain HTTPS API — nothing here is machine-specific — but
+      # it 401s ("unauthorized client detected") unless the request carries
+      # `User-Agent: claude-cli/…`, and pi-ai's anthropic-messages client sets its
+      # own User-Agent AFTER merging a provider `headers:` map. So pointing this
+      # baseURL straight at https://agentrouter.org returns AUTH: 401
+      # UNAUTHENTICATED — verified 1 Sep 2026 with both `User-Agent` and
+      # `user-agent` spellings, while the same request from curl with that UA
+      # answers 200.
+      # Hence the loopback hop: ~/.dsh/agentrouter-proxy/agentrouter-proxy.mjs
+      # rewrites that one header and pipes everything else through untouched. The
+      # installer starts it at login, so this route needs no attention.
       # Custom provider names inherit NOTHING from pi-ai's builtin catalog, so
       # every model must spell out contextWindow/maxTokens/reasoningEfforts or
       # it silently falls back to 262144 ctx / 32768 out with no thinking level.
@@ -627,11 +645,12 @@ llm-pi-ai:
           compat:
             forceAdaptiveThinking: true
 
+#if OMNIROUTE_BASE_URL
     omni-free:
       displayName: Others · Free real APIs via OmniRoute
       apiKeyEnv: OMNIROUTER_API_KEY
       api: openai-completions
-      baseURL: https://omni.theworldofmemories.in/v1
+      baseURL: {{OMNIROUTE_BASE_URL}}
       # Added 28 Aug 2026 for "true connection direct to llm": unlike the `qwen`
       # / `qwen-omni` routes (browser session + prompt-emulated tool calls),
       # every model below is a REAL provider API reached through the existing
@@ -696,12 +715,14 @@ llm-pi-ai:
           maxTokens: 32768
           input: [ text ]
           reasoningEfforts: false
+#endif
 
+#if OMNIROUTE_BASE_URL
     omni-openai-oauth:
       displayName: Others · Omni Router (OpenAI OAuth)
       apiKeyEnv: OMNIROUTER_API_KEY
       api: openai-completions
-      baseURL: https://omni.theworldofmemories.in/v1
+      baseURL: {{OMNIROUTE_BASE_URL}}
       models:
         - id: codex/gpt-5.6-sol
           name: GPT 5.6 Sol · OAuth
@@ -747,6 +768,7 @@ llm-pi-ai:
             xhigh: xhigh
         - id: codex/gpt-5.3-codex-spark
           name: GPT 5.3 Codex Spark · OAuth
+#endif
 
     google:
       displayName: Others · Google Gemini (direct key)
@@ -757,17 +779,30 @@ llm-pi-ai:
       apiKeyEnv: ZAI_API_KEY
 
 agent-default-model:
-  # Was `modlens-nvidia-nim` / deepseek-v4-pro — a provider id that stopped
-  # existing the moment the modlens mirror was switched off, so the default model
-  # dangled and the composer showed "Select model" with nothing chosen. Point it
-  # at the real provider and the fastest capable model.
-  # Deliberately on the Qwen web route: Ayush is testing its tool calling. It is
-  # a chat-only route (tools are emulated in the prompt, so the agent reports
-  # "Tool bash does not exists" and a tool RESULT sent back returns 502), so new
-  # sessions will not do real tool work until this is pointed back at
-  # tabitoken/claude-opus-5-thinking or antigravity/gemini-3.7-flash-high.
+  # The route a NEW session starts on. It must name a provider that actually
+  # exists in this file, or the composer shows "Select model" with nothing chosen
+  # and every new chat is dead until one is picked by hand — which is what
+  # happened when the modlens mirror was switched off and `modlens-nvidia-nim`
+  # stopped existing.
+  #
+  # So this is gated exactly like the providers above: Claude Opus 5 Thinking when
+  # the TabiToken gateway is configured, Gemini 3.7 Flash when only OmniRoute is,
+  # and the local Qwen bridge as the last resort. The bridge always exists, but its
+  # tool calling is prompt-emulated, so switch a tool-heavy session to a real route.
+#if TABITOKEN_BASE_URL
   provider: tabitoken
   model: claude-opus-5-thinking
+#endif
+#ifnot TABITOKEN_BASE_URL
+#if OMNIROUTE_BASE_URL
+  provider: antigravity
+  model: antigravity/gemini-3.7-flash-high
+#endif
+#ifnot OMNIROUTE_BASE_URL
+  provider: qwen
+  model: qwen3.8-max
+#endif
+#endif
 agent-presets:
   # Every NEW session starts on the Opus+Qwen preset (~/.dsh/.agent-presets/
   # opus-qwen): the model above stays the main agent and gets qwen_code /
