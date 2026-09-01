@@ -8,7 +8,8 @@ or, from a clone:
     powershell -ExecutionPolicy Bypass -File .\install.ps1 [-Secrets C:\dsh-secrets.env] [-DryRun] [-SkipQwen]
 
 What it does, in order. Every step is safe to re-run:
-  1. node (>= 22) via winget/fnm when the machine has none, then pnpm
+  1. node (>= 22) unpacked per-user from nodejs.org - no Administrator, no UAC -
+     then pnpm via corepack
   2. @deepseek-ai/dsh pinned to a known-good version, installed globally
   3. credentials from -Secrets / the environment / an existing ~\.dsh\.env
   4. %USERPROFILE%\.dsh: settings.yaml (11 providers), .credentials.yaml, .env
@@ -38,6 +39,27 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Windows PowerShell 5.1 still negotiates TLS 1.0 on some builds, and then every
+# https download here dies with "could not create SSL/TLS secure channel". Ask
+# for 1.2 explicitly; 1.3 only where the runtime knows the value.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 12288 } catch { }
+
+# One log that outlives the console window, so a failure is a file to read rather
+# than a screenshot of output that has already scrolled away.
+$LogPath = Join-Path $env:TEMP 'dsh-install.log'
+$script:Transcribing = $false
+try {
+  Start-Transcript -LiteralPath $LogPath -Force | Out-Null
+  $script:Transcribing = $true
+} catch { }
+function Stop-Log {
+  if ($script:Transcribing) {
+    $script:Transcribing = $false
+    try { Stop-Transcript | Out-Null } catch { }
+  }
+}
 
 # ── constants ───────────────────────────────────────────────────────────────
 
@@ -84,7 +106,13 @@ function Write-Warn($text) {
   Write-Host '      ' -NoNewline; Write-Host '!' -ForegroundColor Yellow -NoNewline; Write-Host " $text"
   $script:Warnings.Add($text) | Out-Null
 }
-function Die($text) { Write-Host ''; Write-Host "error: $text" -ForegroundColor Red; exit 1 }
+function Die($text) {
+  Write-Host ''
+  Write-Host "error: $text" -ForegroundColor Red
+  if ($script:Transcribing) { Write-Host "  full log: $LogPath" -ForegroundColor Yellow }
+  Stop-Log
+  exit 1
+}
 function Invoke-Step([scriptblock]$block, [string]$describe) {
   if ($DryRun) { Write-Host ("      `$ {0}" -f $describe) -ForegroundColor DarkGray }
   else { & $block }
@@ -133,6 +161,7 @@ if (-not $SrcDir -or -not (Test-Path -LiteralPath (Join-Path $SrcDir 'payload'))
 if (-not (Test-Path -LiteralPath (Join-Path $SrcDir 'payload'))) { Die 'payload\ not found next to install.ps1' }
 
 Write-Host 'DeepSeek Harness - one-click setup' -ForegroundColor Blue
+Write-Host ("  shell:   PowerShell {0} ({1})" -f $PSVersionTable.PSVersion, $env:PROCESSOR_ARCHITECTURE) -ForegroundColor DarkGray
 Write-Host ("  payload: {0}" -f $SrcDir) -ForegroundColor DarkGray
 Write-Host ("  target:  {0}" -f $DshHome) -ForegroundColor DarkGray
 if ($DryRun) { Write-Host '  DRY RUN - nothing will be written' -ForegroundColor Yellow }
@@ -147,6 +176,7 @@ if ($Secrets -and -not (Test-Path -LiteralPath $Secrets)) {
   Write-Host '  <this same command, minus -Secrets>'
   Write-Host '  dsh-setup reconfigure --secrets $HOME\dsh-secrets.env'
   Write-Host ''
+  Stop-Log
   exit 2
 }
 
@@ -185,6 +215,7 @@ if ($existing.Count -gt 0 -and -not $KeepConfig -and -not $ReplaceConfig -and -n
   Write-Host '                    the Qwen bridge, the AgentRouter proxy and the patches'
   Write-Host '  $env:DSH_HOME="$HOME\.dsh-new"   install side by side, touching nothing'
   Write-Host ''
+  Stop-Log
   exit 2
 }
 
@@ -205,15 +236,77 @@ function Update-SessionPath {
   $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
 }
 
+# Persist a directory on the user's PATH and make it usable in this process too.
+function Add-UserPath($dir) {
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $userPath) { $userPath = '' }
+  if (($userPath -split ';') -notcontains $dir) {
+    $joined = (@($userPath.Trim(';'), $dir) | Where-Object { $_ }) -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $joined, 'User')
+    $script:PathWasChanged = $true
+  }
+  if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$dir;$env:Path" }
+}
+
+# node WITHOUT Administrator. winget and the MSI both need elevation, so on an
+# ordinary user account all three old paths failed and the install died here at
+# step 1. The official zip needs no installer and no UAC prompt: unpack it under
+# the user's own profile. It also makes `npm install -g` writable without admin,
+# which the very next step needs.
+function Install-NodePortable {
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64')  { 'arm64' }
+          elseif ([Environment]::Is64BitOperatingSystem) { 'x64' }
+          else                                           { 'x86' }
+  $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 60
+  # `lts` is the codename string on an LTS line and the boolean false otherwise.
+  $rel = $index |
+    Where-Object { $_.lts -is [string] } |
+    Where-Object { [int]($_.version.TrimStart('v').Split('.')[0]) -ge $NodeMajorMin } |
+    Select-Object -First 1
+  if (-not $rel) { throw "nodejs.org lists no LTS release >= $NodeMajorMin" }
+
+  $ver   = $rel.version
+  $name  = "node-$ver-win-$arch"
+  $dest  = Join-Path $env:LOCALAPPDATA 'Programs\dsh-node'
+  $zip   = Join-Path $env:TEMP "$name.zip"
+  $stage = Join-Path $env:TEMP "dsh-node-$Stamp"
+  Write-Info "unpacking node $ver ($arch) into $dest"
+
+  Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/$name.zip" -OutFile $zip -TimeoutSec 900 -UseBasicParsing
+  Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+  Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+  $inner = Join-Path $stage $name
+  if (-not (Test-Path -LiteralPath (Join-Path $inner 'node.exe'))) { throw "the node zip has no $name\node.exe" }
+
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+  Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+  Move-Item -LiteralPath $inner -Destination $dest
+  Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+
+  # Prove it runs before claiming success.
+  $exe = Join-Path $dest 'node.exe'
+  $reported = (& $exe -v 2>$null)
+  if (-not $reported) { throw "node.exe unpacked but does not run" }
+  Add-UserPath $dest
+}
+
 if ((Get-NodeMajor) -ge $NodeMajorMin) {
   Write-Ok ("node {0} already usable" -f (& node -v))
 } else {
   if ($DryRun) {
-    Write-Info "would install node $NodeInstallVersion"
+    Write-Info "would unpack node into $env:LOCALAPPDATA\Programs\dsh-node"
   } else {
     $installed = $false
-    if (Test-CommandExists 'winget') {
-      Write-Info 'installing Node.js LTS via winget'
+    try {
+      Install-NodePortable
+      $installed = (Get-NodeMajor) -ge $NodeMajorMin
+      if (-not $installed) { Write-Warn 'unpacked node is not on PATH yet - trying the system installers' }
+    } catch {
+      Write-Warn "portable node install failed ($($_.Exception.Message)) - trying the system installers"
+    }
+    if (-not $installed -and (Test-CommandExists 'winget')) {
+      Write-Info 'installing Node.js LTS via winget (needs Administrator)'
       & winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements 2>$null | Out-Null
       Update-SessionPath
       $installed = (Get-NodeMajor) -ge $NodeMajorMin
@@ -226,22 +319,22 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
       $installed = (Get-NodeMajor) -ge $NodeMajorMin
     }
     if (-not $installed) {
-      # Last resort: the official MSI, installed per-machine and silently.
-      Write-Info 'downloading the Node.js MSI'
+      # Last resort: the official MSI. Silent, but per-machine, so it needs admin.
+      Write-Info 'downloading the Node.js MSI (needs Administrator)'
       $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
       $msi  = Join-Path $env:TEMP "node-lts-$arch.msi"
       try {
         $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30
-        $rel = $index | Where-Object { $_.lts -ne $false } | Select-Object -First 1
+        $rel = $index | Where-Object { $_.lts -is [string] } | Select-Object -First 1
         Invoke-WebRequest -Uri ("https://nodejs.org/dist/{0}/node-{0}-{1}.msi" -f $rel.version, $arch) -OutFile $msi -TimeoutSec 600
         Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait
         Update-SessionPath
         $installed = (Get-NodeMajor) -ge $NodeMajorMin
       } catch {
-        Die "could not install Node.js automatically ($($_.Exception.Message)). Install it from https://nodejs.org and re-run."
+        Write-Warn "the MSI install failed too ($($_.Exception.Message))"
       }
     }
-    if (-not $installed) { Die 'node still not on PATH - open a new PowerShell and re-run' }
+    if (-not $installed) { Die "could not install Node.js. Install it from https://nodejs.org and re-run this command." }
     # Check, do not hope: an older node left active makes corepack, pnpm and dsh
     # all fail later in confusing ways.
     if ((Get-NodeMajor) -lt $NodeMajorMin) {
@@ -787,9 +880,8 @@ if (-not $DryRun -and ($SrcDir -ne $InstallerHome)) {
   )
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if ($userPath -notlike "*$LocalBin*") {
-    [Environment]::SetEnvironmentVariable('Path', "$userPath;$LocalBin", 'User')
+    Add-UserPath $LocalBin
     Write-Info "added $LocalBin to your PATH (new shells only)"
-    $script:PathWasChanged = $true
   }
   Write-Ok 'dsh-setup installed (reconfigure / repatch / qwen / doctor)'
 }
@@ -867,4 +959,9 @@ if ($script:NodeWasInstalled -or $script:PathWasChanged) {
 Write-Host ''
 Write-Host 'Next: sign into the Qwen desktop app once - the bridge borrows that session -'
 Write-Host '      then run dsh web and pick a model.'
+if ($script:Transcribing) {
+  Write-Host ''
+  Write-Host "log: $LogPath" -ForegroundColor DarkGray
+}
+Stop-Log
 exit $script:Failed

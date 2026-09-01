@@ -131,6 +131,54 @@ case "${1:-}" in
     done
     ok "scripts parse"
 
+    # The Windows half shipped broken once because nothing here ever parsed a
+    # .ps1. Use pwsh when the machine has it, else the official container, and
+    # say so loudly when neither is available rather than pretending.
+    PS_FILES="$HERE/install.ps1 $HERE/dsh-setup.ps1 $HERE/payload/qwen-bridge/run.ps1"
+    PS_CHECK='$bad = 0
+      foreach ($f in $args) {
+        $errors = $null; $tokens = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$tokens, [ref]$errors) | Out-Null
+        if ($errors -and $errors.Count) {
+          $bad = 1
+          Write-Host ("FAIL {0}" -f $f)
+          foreach ($e in $errors) { Write-Host ("  line {0}: {1}" -f $e.Extent.StartLineNumber, $e.Message) }
+        }
+      }
+      exit $bad'
+    if command -v pwsh >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      if PS_OUT="$(pwsh -NoProfile -Command "$PS_CHECK" $PS_FILES 2>&1)"; then
+        ok "PowerShell scripts parse (pwsh)"
+      else
+        printf '%s\n' "$PS_OUT" | sed 's/^/  /'
+        die "a .ps1 does not parse"
+      fi
+    elif [ "${DSH_PS_CHECK:-}" = 1 ] && docker info >/dev/null 2>&1; then
+      PS_ARGS=""
+      PS_TMP="$(mktemp -d)"
+      for f in $PS_FILES; do cp "$f" "$PS_TMP/"; PS_ARGS="$PS_ARGS /w/$(basename "$f")"; done
+      # Opt-in only: the PowerShell image is x86 and under emulation on Apple
+      # silicon it takes minutes and aborts at random, so a non-zero exit proves
+      # nothing here. Only FAIL lines are a verdict.
+      PS_OUT=''
+      PS_RAN=0
+      # shellcheck disable=SC2086
+      if PS_OUT="$(docker run --rm -v "$PS_TMP:/w" mcr.microsoft.com/powershell:latest \
+           pwsh -NoProfile -Command "$PS_CHECK" $PS_ARGS 2>&1)"; then PS_RAN=1; fi
+      rm -rf "$PS_TMP"
+      case "$PS_OUT" in
+        *FAIL*)
+          printf '%s\n' "$PS_OUT" | sed 's/^/  /'
+          die "a .ps1 does not parse" ;;
+        *)
+          if [ "$PS_RAN" = 1 ]; then ok "PowerShell scripts parse (container)"
+          else printf '%s!%s the PowerShell container could not run - .ps1 files NOT parsed\n' "$Y" "$N"; fi ;;
+      esac
+    else
+      printf '%s!%s no pwsh here - .ps1 files not parsed (DSH_PS_CHECK=1 uses docker)\n' "$Y" "$N"
+    fi
+
     WORK="$(mktemp -d)"
     TAR="$WORK/dsh-$VERSION.tar.gz"
     ZIP="$WORK/dsh-$VERSION.zip"

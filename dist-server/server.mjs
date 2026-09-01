@@ -168,47 +168,80 @@ exec bash "$TMP/payload/install.sh" --managed "$@"
 }
 
 function bootstrapPs1(token) {
-  return `# Managed DeepSeek Harness — one-line install.
+  // Everything runs inside & { } so nothing leaks into the user's session, and
+  // nothing calls exit: `irm | iex` runs in the console the human is typing in,
+  // and an exit there closes the window with the error still on it.
+  return `# Managed DeepSeek Harness - one-line install.
 #   irm ${PUBLIC_BASE}/w/${token} | iex
-$ErrorActionPreference = 'Stop'
+& {
+  $ErrorActionPreference = 'Stop'
 
-$base  = '${PUBLIC_BASE}'
-$token = '${token}'
-Write-Host 'Managed DeepSeek Harness'
+  # Windows PowerShell 5.1 still negotiates TLS 1.0 on some builds, and then
+  # every https download below dies with "could not create SSL/TLS secure
+  # channel". Ask for 1.2 explicitly; 1.3 only where the runtime knows it.
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 12288 } catch {}
 
-$tmp = Join-Path $env:TEMP ("dsh-managed-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-try {
-  $manifest = Invoke-RestMethod -Uri "$base/manifest.json" -TimeoutSec 30
-  Write-Host ("  release " + $manifest.version)
+  $base  = '${PUBLIC_BASE}'
+  $token = '${token}'
+  $log   = Join-Path $env:TEMP 'dsh-install.log'
+  Write-Host 'Managed DeepSeek Harness' -ForegroundColor Cyan
+  Write-Host ("  PowerShell " + $PSVersionTable.PSVersion + "  " + $env:PROCESSOR_ARCHITECTURE)
 
-  $zipUrl = $manifest.payload.url -replace '\\.tar\\.gz$', '.zip'
-  $archive = Join-Path $tmp 'payload.zip'
+  $tmp = Join-Path $env:TEMP ("dsh-managed-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $keep = $false
   try {
-    Invoke-WebRequest -Uri $zipUrl -OutFile $archive -TimeoutSec 600 -UseBasicParsing
+    $manifest = Invoke-RestMethod -Uri "$base/manifest.json" -TimeoutSec 30
+    Write-Host ("  release " + $manifest.version)
+
+    $zipUrl = $manifest.payload.url -replace '\\.tar\\.gz$', '.zip'
+    $archive = Join-Path $tmp 'payload.zip'
+    try {
+      Invoke-WebRequest -Uri $zipUrl -OutFile $archive -TimeoutSec 600 -UseBasicParsing
+    } catch {
+      throw "download failed: $zipUrl - $($_.Exception.Message)"
+    }
+
+    if ($manifest.payload.sha256zip) {
+      $got = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
+      if ($got -ne $manifest.payload.sha256zip.ToLower()) { throw 'checksum mismatch - refusing to run this download' }
+    }
+
+    $unpack = Join-Path $tmp 'payload'
+    Expand-Archive -LiteralPath $archive -DestinationPath $unpack -Force
+    $inner = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
+    $root = if ($inner -and (Test-Path (Join-Path $inner.FullName 'install.ps1'))) { $inner.FullName } else { $unpack }
+    if (-not (Test-Path (Join-Path $root 'install.ps1'))) { throw "release $($manifest.version) has no install.ps1" }
+
+    $env:DSH_MANAGED      = '1'
+    $env:DSH_DIST_BASE    = $base
+    $env:DSH_DIST_TOKEN   = $token
+    $env:DSH_DIST_VERSION = $manifest.version
+
+    # Prefer PowerShell 7 when the machine has it. -ExecutionPolicy Bypass is
+    # not optional: a default Windows client is Restricted and refuses to run
+    # any .ps1 from disk, signed or not.
+    $pwsh  = Get-Command pwsh -ErrorAction SilentlyContinue
+    $shell = if ($pwsh) { $pwsh.Source } else { 'powershell' }
+    & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install.ps1') -Managed
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+      $keep = $true
+      Write-Host ''
+      Write-Host ("the installer stopped with exit code " + $code) -ForegroundColor Red
+      if (Test-Path -LiteralPath $log) { Write-Host ("  full log: " + $log) -ForegroundColor Yellow }
+    }
   } catch {
-    throw "download failed: $zipUrl"
+    $keep = $true
+    Write-Host ''
+    Write-Host ("install failed: " + $_.Exception.Message) -ForegroundColor Red
+    if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
+    if (Test-Path -LiteralPath $log) { Write-Host ("  full log: " + $log) -ForegroundColor Yellow }
+  } finally {
+    if (-not $keep) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    else { Write-Host ("  working copy kept at " + $tmp) -ForegroundColor DarkGray }
   }
-
-  if ($manifest.payload.sha256zip) {
-    $got = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
-    if ($got -ne $manifest.payload.sha256zip.ToLower()) { throw 'checksum mismatch - refusing to run this download' }
-  }
-
-  $unpack = Join-Path $tmp 'payload'
-  Expand-Archive -LiteralPath $archive -DestinationPath $unpack -Force
-  $inner = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
-  $root = if ($inner -and (Test-Path (Join-Path $inner.FullName 'install.ps1'))) { $inner.FullName } else { $unpack }
-  if (-not (Test-Path (Join-Path $root 'install.ps1'))) { throw "release $($manifest.version) has no install.ps1" }
-
-  $env:DSH_MANAGED      = '1'
-  $env:DSH_DIST_BASE    = $base
-  $env:DSH_DIST_TOKEN   = $token
-  $env:DSH_DIST_VERSION = $manifest.version
-  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install.ps1') -Managed
-  exit $LASTEXITCODE
-} finally {
-  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 `;
 }
@@ -292,6 +325,9 @@ const server = http.createServer(async (req, res) => {
       const file = path.join(PAYLOAD_DIR, m[1]);
       if (!file.startsWith(PAYLOAD_DIR) || !fs.existsSync(file)) return send(res, 404, "no such payload\n");
       const stat = fs.statSync(file);
+      // Logged so a failed install can be placed: bootstrap only = it died before
+      // the download, bootstrap + payload = it died inside install.{sh,ps1}.
+      log("payload", m[1], req.headers["user-agent"] || "");
       res.writeHead(200, {
         "content-type": m[1].endsWith(".zip") ? "application/zip" : "application/gzip",
         "content-length": stat.size,
