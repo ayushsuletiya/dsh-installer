@@ -530,6 +530,33 @@ fi
 run mkdir -p "$PROFILE_DIR"
 
 run cp "$SRC_DIR/payload/profile-web/package.json" "$PROFILE_DIR/package.json"
+
+# One bundle is a git dependency (dsh-at-file pins a tag newer than the registry
+# copy), and pnpm needs a WORKING git to resolve it — otherwise the whole install
+# fails and none of the ten bundles land. Test git by running it, not by looking it
+# up: macOS ships /usr/bin/git as a stub that pops the Xcode CLT installer, so
+# `command -v git` succeeds on a machine that cannot actually clone.
+if [ "$DRY_RUN" = 0 ] && [ -f "$PROFILE_DIR/package.json" ]; then
+  if git --version >/dev/null 2>&1; then
+    ok "git available — keeping the pinned dsh-at-file tag"
+  else
+    node -e '
+      const fs = require("node:fs");
+      const file = process.argv[1];
+      const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+      let swapped = 0;
+      for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
+        if (typeof spec === "string" && /^(github:|git\+|git:)/.test(spec)) {
+          pkg.dependencies[name] = "*";
+          swapped += 1;
+        }
+      }
+      if (swapped) fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+      process.stdout.write(String(swapped));
+    ' "$PROFILE_DIR/package.json" >/dev/null 2>&1 || true
+    warn "no working git — git-pinned bundles fall back to their npm release"
+  fi
+fi
 for f in compaction-llm-retry.mjs web-search-ddg.mjs llm-turn-fallback.mjs qwen-coder.mjs command-clear.mjs; do
   run cp "$SRC_DIR/payload/profile-web/$f" "$PROFILE_DIR/$f"
 done
@@ -584,6 +611,14 @@ if [ -n "$DSHX_META_ADS_ENABLED" ]; then ok "Meta Ads MCP: 3 rows enabled"; else
 if [ -n "$DSHX_HOSTINGER_API_TOKEN" ]; then ok "Hostinger mail MCP: enabled"; else info "Hostinger mail MCP: skipped (no token)"; fi
 if [ -n "$DSHX_MULTILOGIN_DIR" ]; then ok "Multilogin MCP: enabled"; else info "Multilogin MCP: skipped (~/multilogin-mcp absent)"; fi
 info "UI Skills MCP: always on (keyless)"
+
+# Approve the native build scripts the profile needs. Which key pnpm reads has
+# moved twice, and pnpm 11 exits non-zero when it is missing even though every
+# package installed — so this is handled in one place for both platforms.
+if [ "$DRY_RUN" = 0 ] && [ -f "$PROFILE_DIR/pnpm-workspace.yaml" ]; then
+  node "$SRC_DIR/tools/pnpm-allow-builds.mjs" "$PROFILE_DIR/pnpm-workspace.yaml" >/dev/null 2>&1 \
+    || warn "could not write pnpm build approvals"
+fi
 
 if [ "$SKIP_PROFILE_INSTALL" = 0 ] && [ "$DRY_RUN" = 0 ]; then
   info "installing the plugin bundles — the slow step, a few minutes on first run"

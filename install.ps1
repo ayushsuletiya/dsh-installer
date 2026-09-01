@@ -485,6 +485,28 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'cordis.yml')) -and -not
 Invoke-Step {
   Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\profile-web\package.json') -Destination (Join-Path $ProfileDir 'package.json') -Force
 } 'copy package.json'
+
+# One bundle is a git dependency and pnpm needs a working git to resolve it, or the
+# whole install fails and none of the ten bundles land. Windows ships no git.
+if (-not $DryRun) {
+  $gitWorks = $false
+  try { & git --version 2>$null | Out-Null; $gitWorks = ($LASTEXITCODE -eq 0) } catch { $gitWorks = $false }
+  if ($gitWorks) {
+    Write-Ok 'git available - keeping the pinned dsh-at-file tag'
+  } else {
+    & node -e '
+      const fs = require("node:fs");
+      const file = process.argv[1];
+      const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+      let swapped = 0;
+      for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
+        if (typeof spec === "string" && /^(github:|git\+|git:)/.test(spec)) { pkg.dependencies[name] = "*"; swapped += 1; }
+      }
+      if (swapped) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+    ' (Join-Path $ProfileDir 'package.json') 2>$null
+    Write-Warn 'no working git - git-pinned bundles fall back to their npm release'
+  }
+}
 foreach ($f in @('compaction-llm-retry.mjs','web-search-ddg.mjs','llm-turn-fallback.mjs','qwen-coder.mjs','command-clear.mjs')) {
   Invoke-Step {
     Copy-Item -LiteralPath (Join-Path $SrcDir "payload\profile-web\$f") -Destination (Join-Path $ProfileDir $f) -Force
@@ -533,6 +555,15 @@ if ($env:DSHX_META_ADS_ENABLED) { Write-Ok 'Meta Ads MCP: 3 rows enabled' } else
 if ($Secret['HOSTINGER_API_TOKEN'])   { Write-Ok 'Hostinger mail MCP: enabled' }   else { Write-Info 'Hostinger mail MCP: skipped (no token)' }
 if ($env:DSHX_MULTILOGIN_DIR)         { Write-Ok 'Multilogin MCP: enabled' }       else { Write-Info 'Multilogin MCP: skipped (multilogin-mcp absent)' }
 Write-Info 'UI Skills MCP: always on (keyless)'
+
+# Approve the native build scripts the profile needs. Which key pnpm reads has
+# moved twice, and pnpm 11 exits non-zero when it is missing even though every
+# package installed — so this is handled in one place for both platforms.
+$wsPath = Join-Path $ProfileDir 'pnpm-workspace.yaml'
+if (-not $DryRun -and (Test-Path -LiteralPath $wsPath)) {
+  & node (Join-Path $SrcDir 'tools\pnpm-allow-builds.mjs') $wsPath 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { Write-Warn 'could not write pnpm build approvals' }
+}
 
 if (-not $SkipProfileInstall -and -not $DryRun) {
   Write-Info 'installing the plugin bundles - the slow step, a few minutes on first run'
