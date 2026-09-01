@@ -177,6 +177,37 @@ node "$INSTALLER/tools/render.mjs" \
   "$DSH_HOME/.agent-presets/opus-qwen/agent.cordis.yml" >/dev/null
 ok "opus-qwen preset rendered"
 
+# ── the Qwen bridge, in here rather than on the host ────────────────────────
+# The Qwen desktop app has to run on the host (it is a GUI app the human signs
+# into), but the bridge that drives it does not. Running it here is what makes the
+# container standalone: a fresh machine needs the Qwen app and nothing else.
+# QWEN_CDP_HOST points the bridge at the host's debugging port; set
+# DSH_NO_QWEN_BRIDGE=1 when the host already runs its own bridge on 3083.
+if [ "${DSH_NO_QWEN_BRIDGE:-0}" != 1 ] && [ -f "$INSTALLER/payload/qwen-bridge/server-app.mjs" ]; then
+  BRIDGE_DIR="$DSH_HOME/qwen-bridge"
+  mkdir -p "$BRIDGE_DIR"
+  for f in server-app.mjs qwen-app-client.mjs qwen-auth.mjs qwen-login.mjs \
+           server-oauth.mjs tool-formatter.mjs push-creds.mjs; do
+    if [ -f "$INSTALLER/payload/qwen-bridge/$f" ]; then
+      cp "$INSTALLER/payload/qwen-bridge/$f" "$BRIDGE_DIR/$f"
+    fi
+  done
+  if curl -fsS --max-time 3 "http://${HOST_GW}:3083/health" >/dev/null 2>&1; then
+    ok "Qwen bridge already answering on the host — using that one"
+  else
+    (
+      cd "$BRIDGE_DIR"
+      QWEN_CDP_HOST="$HOST_GW" \
+      QWEN_BRIDGE_HOST=127.0.0.1 \
+      QWEN_BRIDGE_PORT=3083 \
+      node server-app.mjs >>"$DSH_HOME/logs/qwen-bridge.log" 2>&1 &
+    )
+    # The provider must then talk to the in-container bridge, not the host's.
+    sed -i -e "s|http://${HOST_GW}:3083|http://127.0.0.1:3083|g" "$DSH_HOME/settings.yaml"
+    ok "Qwen bridge started in the container (drives the app on ${HOST_GW}:9222)"
+  fi
+fi
+
 # ── serve ────────────────────────────────────────────────────────────────────
 # The harness only ever listens on loopback — that is its own safety rule, and its
 # config schema allows nothing else — so a raw TCP relay carries the published

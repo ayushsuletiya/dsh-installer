@@ -56,7 +56,7 @@
   $haveDocker = $null -ne (Get-Command docker -ErrorAction SilentlyContinue)
   if (-not $haveDocker) {
     Say ''
-    Say '[1/5] Docker Desktop'
+    Say '[1/6] Docker Desktop'
     if ($null -eq (Get-Command winget -ErrorAction SilentlyContinue)) {
       Die 'Docker Desktop is not installed and winget is unavailable. Install Docker Desktop from https://docs.docker.com/desktop/install/windows-install/ and re-run this command.'
     }
@@ -75,7 +75,7 @@
     Ok 'Docker Desktop installed'
   } else {
     Say ''
-    Say '[1/5] Docker'
+    Say '[1/6] Docker'
     Ok ((DockerOut @('--version')) -replace 'Docker version ', 'docker ')
   }
 
@@ -98,7 +98,7 @@
 
   # ── 2. which image ─────────────────────────────────────────────────────────
   Say ''
-  Say '[2/5] Release'
+  Say '[2/6] Release'
   $manifest = Invoke-RestMethod -Uri "$base/manifest.json" -TimeoutSec 30
   if (-not $manifest.image -or -not $manifest.image.reference) {
     Die "this service is not publishing a container image yet (manifest has no image.reference)"
@@ -108,14 +108,14 @@
 
   # ── 3. pull ────────────────────────────────────────────────────────────────
   Say ''
-  Say '[3/5] Download'
+  Say '[3/6] Download'
   Say '      about 1 GB the first time; later updates only fetch what changed.'
   if ((Docker @('pull', $image)) -ne 0) { Die "could not pull $image" }
   Ok 'image ready'
 
   # ── 4. run ─────────────────────────────────────────────────────────────────
   Say ''
-  Say '[4/5] Start'
+  Say '[4/6] Start'
 
   # The earlier native install ran its own `dsh web` from a logon task, which
   # would hold port 3080 and make the container fail to bind. Its Qwen bridge and
@@ -156,9 +156,72 @@
   Ok ("container " + $name + " started")
   Ok ("your files are mounted at /work (from " + $env:USERPROFILE + ")")
 
-  # ── 5. shortcut + updater ──────────────────────────────────────────────────
+  # ── 4b. the Qwen desktop app ────────────────────────────────────────────────
+  # The only thing that genuinely has to live on Windows: a GUI app the human signs
+  # into. The bridge that drives it runs inside the container and reaches its
+  # debugging port through host.docker.internal, so this is the last host-side
+  # piece and it is installed here rather than left as a manual step.
   Say ''
-  Say '[5/5] Launcher'
+  Say '[5/6] Qwen desktop app'
+  $qwenExe = Join-Path $env:LOCALAPPDATA 'Programs\Qwen\Qwen.exe'
+  if (-not (Test-Path -LiteralPath $qwenExe)) {
+    $alt = Join-Path $env:ProgramFiles 'Qwen\Qwen.exe'
+    if (Test-Path -LiteralPath $alt) { $qwenExe = $alt }
+  }
+  if (-not (Test-Path -LiteralPath $qwenExe)) {
+    try {
+      $cfg = Invoke-RestMethod -Uri 'https://qwen.ai/api/config?api.app_download_url' -TimeoutSec 40
+      $dl = $null
+      if ($cfg.data -and $cfg.data.app_download_url) { $dl = $cfg.data.app_download_url.windows }
+      elseif ($cfg.app_download_url) { $dl = $cfg.app_download_url.windows }
+      if (-not $dl) { throw 'the Qwen config did not carry a Windows download URL' }
+      $setup = Join-Path $env:TEMP 'qwen-setup.exe'
+      Say ("      downloading " + $dl)
+      Invoke-WebRequest -Uri $dl -OutFile $setup -TimeoutSec 900 -UseBasicParsing
+      Say '      running the silent installer'
+      $proc = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+      Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue
+      foreach ($candidate in @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Qwen\Qwen.exe'),
+        (Join-Path $env:ProgramFiles 'Qwen\Qwen.exe')
+      )) {
+        if (Test-Path -LiteralPath $candidate) { $qwenExe = $candidate; break }
+      }
+      if (Test-Path -LiteralPath $qwenExe) { Ok ('installed ' + $qwenExe) }
+      else { Warn 'the Qwen installer ran but the app was not found - get it from https://qwen.ai/download' }
+    } catch {
+      Warn ('could not install the Qwen app automatically (' + $_.Exception.Message + ') - get it from https://qwen.ai/download')
+    }
+  } else {
+    Ok ('already installed: ' + $qwenExe)
+  }
+
+  # The bridge can only attach when the app was started WITH the debugging flag,
+  # so a logon task owns that rather than the human remembering it.
+  if (Test-Path -LiteralPath $qwenExe) {
+    try {
+      $qAct = New-ScheduledTaskAction -Execute $qwenExe -Argument '--remote-debugging-port=9222'
+      $qTrg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+      $qSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+      Register-ScheduledTask -TaskName 'Qwen (debugging port)' -Action $qAct -Trigger $qTrg -Settings $qSet `
+        -Description 'Starts the Qwen desktop app so the harness can use its session' -Force | Out-Null
+      Ok 'Qwen starts at logon with the debugging port open'
+    } catch {
+      Warn ('could not register the Qwen logon task (' + $_.Exception.Message + ')')
+    }
+    $already = $false
+    try { $already = $null -ne (Get-Process -Name 'Qwen' -ErrorAction SilentlyContinue) } catch { }
+    if (-not $already) {
+      Start-Process -FilePath $qwenExe -ArgumentList '--remote-debugging-port=9222' | Out-Null
+      Ok 'launched - sign in once and the harness uses that session'
+    } else {
+      Warn 'Qwen is already running; restart it from the new shortcut so the debugging port is open'
+    }
+  }
+
+  # ── 6. shortcut + updater ──────────────────────────────────────────────────
+  Say ''
+  Say '[6/6] Launcher'
   New-Item -ItemType Directory -Force -Path $localBin | Out-Null
 
   $openPs1 = Join-Path $localBin 'open-harness.ps1'
@@ -258,6 +321,6 @@
     Say '  docker logs deepseek-harness   shows what it is doing'
   }
   Say ''
-  Say 'One manual step, once: sign into the Qwen desktop app on Windows - the'
-  Say 'harness reaches it through host.docker.internal for Qwen requests.'
+  Say 'One manual step, once: sign into the Qwen desktop app that just opened.'
+  Say 'Everything else is done, and stays done across updates.'
 }

@@ -14,6 +14,11 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const CDP_PORT = Number(process.env.QWEN_CDP_PORT || 9222);
+// Where the Qwen desktop app's debugging port lives. Loopback when the bridge and
+// the app share a machine; `host.docker.internal` when the bridge runs in a
+// container and the app runs on the Windows or macOS host.
+const CDP_HOST = process.env.QWEN_CDP_HOST || "127.0.0.1";
+const CDP_REMOTE = CDP_HOST !== "127.0.0.1" && CDP_HOST !== "localhost";
 const APP_NAME = process.env.QWEN_APP_NAME || "Qwen";
 const PAGE_MATCH = "chat.qwen.ai";
 const BINDING = "__dshQwenEmit";
@@ -103,7 +108,7 @@ export class QwenAppClient {
   // ---------- CDP plumbing ----------
 
   async targets() {
-    const res = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`, { signal: AbortSignal.timeout(4000) });
+    const res = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`, { signal: AbortSignal.timeout(4000) });
     if (!res.ok) throw new Error(`CDP list failed: ${res.status}`);
     return res.json();
   }
@@ -111,7 +116,17 @@ export class QwenAppClient {
   async findPage() {
     const list = await this.targets().catch(() => null);
     if (!list) return null;
-    return list.find((t) => (t.url || "").includes(PAGE_MATCH) && t.webSocketDebuggerUrl) || null;
+    const page = list.find((t) => (t.url || "").includes(PAGE_MATCH) && t.webSocketDebuggerUrl) || null;
+    if (page === null) return null;
+    // Chromium advertises its socket as ws://127.0.0.1:<port>/..., which from
+    // another network namespace resolves to the wrong machine. Repoint it at the
+    // host we actually reached the HTTP endpoint on.
+    if (CDP_REMOTE) {
+      const url = new URL(page.webSocketDebuggerUrl);
+      url.hostname = CDP_HOST;
+      return { ...page, webSocketDebuggerUrl: url.href };
+    }
+    return page;
   }
 
   // The debugging port only exists if the app was started with the flag, so a
@@ -119,6 +134,14 @@ export class QwenAppClient {
   // is dead.
   async ensureApp() {
     if (await this.findPage()) return true;
+    if (CDP_REMOTE) {
+      // The app is on the host and this process is not; relaunching is the
+      // human's job, so say exactly what is needed instead of failing vaguely.
+      throw new Error(
+        `no Qwen page on ${CDP_HOST}:${CDP_PORT} — open the Qwen desktop app on the host ` +
+          `(started with --remote-debugging-port=${CDP_PORT}) and sign in once`,
+      );
+    }
     log("no CDP page; restarting the Qwen app with remote debugging");
     const { quit, launch } = appLauncher();
     await new Promise((r) => {
@@ -428,13 +451,13 @@ export class QwenAppClient {
 
   async health() {
     const page = await this.findPage();
-    if (!page) return { app: "not running with debugging port", cdpPort: CDP_PORT };
+    if (!page) return { app: "not running with debugging port", cdpHost: CDP_HOST, cdpPort: CDP_PORT };
     let loggedIn = null, version = null;
     try {
       const info = await this.evaluate(`(() => ({ t: !!localStorage.getItem("token"), u: location.href }))()`);
       loggedIn = info?.t ?? null;
       version = (await this.evaluate(`(window.__dshQwen && window.__dshQwen.version) || null`)) || null;
     } catch {}
-    return { app: "attached", cdpPort: CDP_PORT, page: page.url, loggedIn, feVersion: version };
+    return { app: "attached", cdpHost: CDP_HOST, cdpPort: CDP_PORT, page: page.url, loggedIn, feVersion: version };
   }
 }
