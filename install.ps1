@@ -99,6 +99,7 @@ $script:NodeExe     = ''
 $script:NpmCmd      = ''
 $script:CorepackCmd = ''
 $script:GlobalBin   = ''
+$script:WebLauncher = ''
 # Managed install: the bootstrap from the distribution service sets these. The
 # machine is ours to configure, so config is fetched by token and applied without
 # asking, and an updater task is registered at the end.
@@ -1063,6 +1064,70 @@ if (-not $DryRun -and ($SrcDir -ne $InstallerHome)) {
   Write-Ok 'dsh-setup installed (reconfigure / repatch / qwen / doctor)'
 }
 
+# ── launcher: a thing to double-click, not a command to remember ─────────────
+#
+# An install that ends at a prompt with "now run dsh web" is not finished. The
+# shortcut below starts the server, waits for the port and opens the browser, and
+# the dsh.cmd shim makes `dsh` work from any shell even when npm's global bin
+# never reached PATH.
+
+if (-not $DryRun) {
+  if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
+  if ($DshCmd) {
+    New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null
+
+    $dshShim = Join-Path $LocalBin 'dsh.cmd'
+    Set-Content -LiteralPath $dshShim -Encoding ASCII -Value @(
+      '@echo off',
+      ('"{0}" %*' -f $DshCmd)
+    )
+
+    $script:WebLauncher = Join-Path $LocalBin 'dsh-web.ps1'
+    Set-Content -LiteralPath $script:WebLauncher -Encoding UTF8 -Value @(
+      '# Start the DeepSeek Harness web UI, wait for it, then open the browser.',
+      "`$ErrorActionPreference = 'SilentlyContinue'",
+      ('$dsh = "{0}"' -f $DshCmd),
+      ("`$url = 'http://127.0.0.1:3080'"),
+      'function Test-Up {',
+      '  try { Invoke-WebRequest -Uri $url -TimeoutSec 2 -UseBasicParsing | Out-Null; return $true }',
+      '  catch { return $false }',
+      '}',
+      'if (-not (Test-Up)) {',
+      "  Start-Process -FilePath `$dsh -ArgumentList 'web' -WindowStyle Minimized",
+      '  foreach ($i in 1..60) { Start-Sleep -Seconds 1; if (Test-Up) { break } }',
+      '}',
+      'Start-Process $url'
+    )
+
+    Set-Content -LiteralPath (Join-Path $LocalBin 'dsh-web.cmd') -Encoding ASCII -Value @(
+      '@echo off',
+      ('powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $script:WebLauncher)
+    )
+
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $where = @()
+    try {
+      $ws = New-Object -ComObject WScript.Shell
+      foreach ($folder in @('Desktop', 'Programs')) {
+        $dir = [Environment]::GetFolderPath($folder)
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+        $sc = $ws.CreateShortcut((Join-Path $dir 'DeepSeek Harness.lnk'))
+        $sc.TargetPath       = $psExe
+        $sc.Arguments        = ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $script:WebLauncher)
+        $sc.WorkingDirectory = $LocalBin
+        $sc.Description      = 'Start the DeepSeek Harness web UI'
+        $sc.IconLocation     = ((Resolve-NodeExe) + ',0')
+        $sc.Save()
+        $where += $(if ($folder -eq 'Programs') { 'Start menu' } else { 'Desktop' })
+      }
+    } catch {
+      Write-Warn ("could not create the shortcut ({0}) - start it with: dsh web" -f $_.Exception.Message)
+    }
+    if ($where.Count) { Write-Ok ('"DeepSeek Harness" on your ' + ($where -join ' and ')) }
+    Write-Ok 'dsh and dsh-web shims installed'
+  }
+}
+
 if (-not $DryRun) {
   if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
   try {
@@ -1112,8 +1177,7 @@ Write-Host '----------------------------------------' -ForegroundColor Green
 if ($DryRun) {
   Write-Host 'Dry run complete - nothing was written.'
 } else {
-  Write-Host 'Done.' -ForegroundColor Green -NoNewline
-  Write-Host '  Start it with:  dsh web'
+  Write-Host 'Done.' -ForegroundColor Green
 }
 
 if ($script:Warnings.Count -gt 0) {
@@ -1127,17 +1191,28 @@ if ($script:Missing.Count -gt 0 -and -not $Managed) {
   foreach ($m in $script:Missing) { Write-Host "  $m" }
 }
 
-if ($script:NodeWasInstalled -or $script:PathWasChanged) {
+# Finish the job rather than handing over a command to type. The launcher starts
+# the server, waits for the port and opens the browser.
+if (-not $DryRun -and $script:WebLauncher -and (Test-Path -LiteralPath $script:WebLauncher)) {
   Write-Host ''
-  Write-Host 'Open a new PowerShell before anything else.' -ForegroundColor Yellow
-  if ($script:NodeWasInstalled) { Write-Host ("  node lives in {0}" -f (Split-Path -Parent $NodeBin)) }
-  if ($script:GlobalBin)        { Write-Host ("  dsh lives in {0}" -f $script:GlobalBin) }
-  if ($script:PathWasChanged)   { Write-Host '  both, and ~\.local\bin, were added to your PATH - only new shells see it' }
+  Write-Host 'Opening DeepSeek Harness at http://127.0.0.1:3080 ...' -ForegroundColor Cyan
+  try {
+    Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+      -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script:WebLauncher)
+    Write-Host '  it can take up to a minute the first time.'
+  } catch {
+    Write-Host ('  could not start it automatically: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+  }
+  Write-Host ''
+  Write-Host 'From now on: double-click "DeepSeek Harness" on your Desktop.'
+} else {
+  Write-Host ''
+  Write-Host 'Start it with:  dsh web'
 }
 
 Write-Host ''
-Write-Host 'Next: sign into the Qwen desktop app once - the bridge borrows that session -'
-Write-Host '      then run dsh web and pick a model.'
+Write-Host 'One manual step, once: sign into the Qwen desktop app - the bridge borrows'
+Write-Host 'that session for every Qwen request.'
 if ($script:Transcribing) {
   Write-Host ''
   Write-Host "log: $LogPath" -ForegroundColor DarkGray
