@@ -21,6 +21,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# The tools below print UTF-8; a Windows console would otherwise decode them with
+# the legacy OEM code page and mangle every dash.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 # Windows PowerShell turns a native command's stderr into error records as soon as
 # it is redirected, and 'Stop' then makes a harmless npm warning fatal. Every
 # external tool goes through these two, with 'Stop' suspended for the call.

@@ -46,6 +46,11 @@ Set-StrictMode -Version Latest
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 12288 } catch { }
 
+# The tools this script runs print UTF-8. A Windows console decodes their output
+# with the legacy OEM code page unless told otherwise, which turns an em dash into
+# "ГÇö" and makes a healthy install look broken.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 # One log that outlives the console window, so a failure is a file to read rather
 # than a screenshot of output that has already scrolled away.
 $LogPath = Join-Path $env:TEMP 'dsh-install.log'
@@ -763,7 +768,7 @@ for (const [name, spec] of Object.entries(pkg.dependencies || {})) {
 }
 if (swapped) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
 '@ @((Join-Path $ProfileDir 'package.json'))
-    if ($swapCode -eq 0) { Write-Warn 'no working git - git-pinned bundles fall back to their npm release' }
+    if ($swapCode -eq 0) { Write-Ok 'no git on this machine - git-pinned bundles use their npm release instead' }
     else { Write-Warn 'no working git, and the fallback rewrite failed - the bundle install may fail' }
   }
 }
