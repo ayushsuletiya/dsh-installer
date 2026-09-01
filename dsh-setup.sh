@@ -37,7 +37,7 @@ CMD="${1:-}"
 case "$CMD" in
   reconfigure)
     # Everything except the Node/DSH bootstrap and the Qwen app download.
-    exec bash "$HERE/install.sh" --skip-qwen --skip-profile-install "$@"
+    exec bash "$HERE/install.sh" --replace-config --skip-qwen --skip-profile-install "$@"
     ;;
 
   repatch)
@@ -183,7 +183,7 @@ case "$CMD" in
       warn "payload at $HERE is not a git clone; re-run install.sh from the repo"
       exit 1
     fi
-    exec bash "$HERE/install.sh" --skip-qwen "$@"
+    exec bash "$HERE/install.sh" --replace-config --skip-qwen "$@"
     ;;
 
   ''|-h|--help|help) usage ;;

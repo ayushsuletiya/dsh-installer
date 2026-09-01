@@ -29,6 +29,9 @@ param(
   [switch]$SkipQwen,
   [switch]$SkipPatch,
   [switch]$SkipProfileInstall,
+  [switch]$ReplaceConfig,
+  [switch]$KeepConfig,
+  [switch]$AllowDowngrade,
   [string]$DshVersion = '0.1.1-rc.2'
 )
 
@@ -101,6 +104,44 @@ Write-Host 'DeepSeek Harness - one-click setup' -ForegroundColor Blue
 Write-Host ("  payload: {0}" -f $SrcDir) -ForegroundColor DarkGray
 Write-Host ("  target:  {0}" -f $DshHome) -ForegroundColor DarkGray
 if ($DryRun) { Write-Host '  DRY RUN - nothing will be written' -ForegroundColor Yellow }
+
+# ── existing installation guard ──────────────────────────────────────────────
+
+# This installer WRITES settings.yaml, .credentials.yaml, .env, the web profile's
+# package.json and cordis.patch.yml. On a machine that already has a DSH setup that
+# means replacing that person's providers, plugin list and MCP rows — so it stops
+# and makes the choice explicit instead of silently taking over.
+#
+# Chat history is never involved: sessions\, storages\ and task-board\ are not
+# touched by any step, and every replaced file is copied to .bak.<timestamp> first.
+$existing = @()
+foreach ($f in @(
+  @{ Path = (Join-Path $DshHome 'settings.yaml');        Note = '' },
+  @{ Path = (Join-Path $DshHome '.credentials.yaml');    Note = '' },
+  @{ Path = (Join-Path $ProfileDir 'package.json');      Note = ' (your plugin list)' },
+  @{ Path = (Join-Path $ProfileDir 'cordis.patch.yml');  Note = ' (your MCP rows)' }
+)) {
+  if (Test-Path -LiteralPath $f.Path) { $existing += ($f.Path + $f.Note) }
+}
+
+if ($existing.Count -gt 0 -and -not $KeepConfig -and -not $ReplaceConfig -and -not $DryRun) {
+  Write-Host ''
+  Write-Host 'This machine already has a DeepSeek Harness setup.' -ForegroundColor Yellow
+  Write-Host ''
+  Write-Host "These files would be REPLACED (each one backed up to .bak.$Stamp first):"
+  foreach ($e in $existing) { Write-Host "  $e" }
+  Write-Host ''
+  Write-Host 'Your chats are safe either way - sessions, workspace index and task board'
+  Write-Host 'are never touched.'
+  Write-Host ''
+  Write-Host 'Pick one:'
+  Write-Host '  -ReplaceConfig    take over this setup (backups are kept)'
+  Write-Host '  -KeepConfig       leave every config file alone; install only the runtime,'
+  Write-Host '                    the Qwen bridge, the AgentRouter proxy and the patches'
+  Write-Host '  $env:DSH_HOME="$HOME\.dsh-new"   install side by side, touching nothing'
+  Write-Host ''
+  exit 2
+}
 
 # ── 1. node + pnpm ──────────────────────────────────────────────────────────
 
@@ -178,8 +219,32 @@ Write-Step "DeepSeek Harness $DshVersion"
 
 $currentDsh = ''
 if (Test-CommandExists 'dsh') { try { $currentDsh = (& dsh --version 2>$null) } catch {} }
+function Test-NewerVersion($have, $pin) {
+  if (-not $have) { return $false }
+  # Same comparison as install.sh, done in node so both platforms agree.
+  & node -e '
+    const cmp = (a, b) => {
+      const norm = (v) => String(v).replace(/^v/, "").split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
+      const A = norm(a), B = norm(b);
+      for (let i = 0; i < Math.max(A.length, B.length); i++) {
+        const x = A[i], y = B[i];
+        if (x === y) continue;
+        if (x === undefined) return -1;
+        if (y === undefined) return 1;
+        if (typeof x === typeof y) return x > y ? 1 : -1;
+        return typeof x === "number" ? 1 : -1;
+      }
+      return 0;
+    };
+    process.exit(cmp(process.argv[1], process.argv[2]) > 0 ? 0 : 1);
+  ' $have $pin 2>$null
+  return ($LASTEXITCODE -eq 0)
+}
+
 if ($currentDsh -eq $DshVersion) {
   Write-Ok "dsh $DshVersion already installed"
+} elseif ($currentDsh -and -not $AllowDowngrade -and (Test-NewerVersion $currentDsh $DshVersion)) {
+  Write-Warn "keeping your newer dsh $currentDsh (this installer pins $DshVersion; use -AllowDowngrade to force it)"
 } else {
   Write-Info "npm install -g @deepseek-ai/dsh@$DshVersion"
   if (-not $DryRun) {
@@ -278,7 +343,12 @@ foreach ($d in @((Join-Path $DshHome 'logs'), $PresetDir, $InstallerHome, $Profi
   Invoke-Step { New-Item -ItemType Directory -Force -Path $d | Out-Null } "mkdir $d"
 }
 
+if ($KeepConfig) {
+  Write-Info '-KeepConfig: settings.yaml, .credentials.yaml and .env left untouched'
+}
+
 $settingsPath = Join-Path $DshHome 'settings.yaml'
+if (-not $KeepConfig) {
 Backup-File $settingsPath
 # settings.yaml is rendered, not copied: the gateway addresses live in the secrets
 # file, and a provider whose endpoint is blank is dropped rather than left pointing
@@ -321,10 +391,15 @@ if (-not $DryRun) {
   Protect-File $envPath
 }
 Write-Ok '.env (locked to your account)'
+}  # KeepConfig
 
 # ── 5. web profile ──────────────────────────────────────────────────────────
 
 Write-Step 'Web profile: bundles, local plugins, MCP rows'
+
+if ($KeepConfig) {
+  Write-Info '-KeepConfig: your profile, plugin list and MCP rows left untouched'
+} else {
 
 if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'cordis.yml')) -and -not $DryRun) {
   Write-Info 'scaffolding the profile with dsh itself'
@@ -398,10 +473,15 @@ if (-not $SkipProfileInstall -and -not $DryRun) {
   Write-Info 'plugin install skipped'
 }
 
+}  # KeepConfig
+
 # ── 6. agent preset ─────────────────────────────────────────────────────────
 
 Write-Step 'Agent preset: opus-qwen'
 
+if ($KeepConfig) {
+  Write-Info '-KeepConfig: agent presets left untouched'
+} else {
 Invoke-Step {
   Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\preset.yml') -Destination (Join-Path $PresetDir 'preset.yml') -Force
 } 'copy preset.yml'
@@ -412,6 +492,7 @@ if (-not $DryRun) {
   if ($LASTEXITCODE -ne 0) { Die 'rendering the agent preset failed' }
 }
 Write-Ok 'Opus thinks - qwen_code writes - subagent_qwen drives the files'
+}  # KeepConfig
 
 # ── 7. model picker patches ─────────────────────────────────────────────────
 
@@ -490,7 +571,17 @@ if ($SkipQwen) {
   }
 
   # A logon Scheduled Task is the Windows counterpart of the macOS LaunchAgent.
+  # Someone who already runs a bridge must not end up with two supervisors
+  # fighting over port 3083 — the loser EADDRINUSE-loops forever.
+  $bridgeAlready = $false
   if (-not $DryRun) {
+    try {
+      Invoke-WebRequest -Uri 'http://127.0.0.1:3083/health' -TimeoutSec 3 -UseBasicParsing | Out-Null
+      $bridgeAlready = $true
+      Write-Warn 'something already serves :3083 - not registering a second bridge'
+    } catch {}
+  }
+  if (-not $DryRun -and -not $bridgeAlready) {
     $taskName = 'DSH Qwen Bridge'
     $runPs1   = Join-Path $BridgeDir 'run.ps1'
     try {

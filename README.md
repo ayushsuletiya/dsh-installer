@@ -54,6 +54,32 @@ Every step is idempotent — re-running is safe and only does what is missing. U
 | **Model picker** | search across provider/model/id + collapsible provider groups, folding persisted in localStorage |
 | **Qwen** | desktop app downloaded and installed automatically, plus the CDP bridge on `127.0.0.1:3083`, kept alive by a LaunchAgent (macOS) or logon Scheduled Task (Windows) |
 
+## If the machine already has DSH
+
+The installer **stops and asks** rather than taking over. It writes `settings.yaml`,
+`.credentials.yaml`, `.env`, the profile's `package.json` and `cordis.patch.yml`, so on
+a machine that already has a setup those are someone's providers, plugin list and
+MCP rows. Run it there and you get a list of exactly what would be replaced plus
+three ways forward:
+
+| | what it does |
+| --- | --- |
+| `--replace-config` / `-ReplaceConfig` | take over. Every replaced file is copied to `<name>.bak.<timestamp>` first, so the old provider set stays recoverable. |
+| `--keep-config` / `-KeepConfig` | touch no config at all. Installs only the runtime, the Qwen bridge, the AgentRouter proxy and the model-picker patches. |
+| `DSH_HOME=~/.dsh-new` | a completely separate setup, side by side. Nothing existing is read or written. |
+
+**Chat history is never involved.** `sessions/`, `storages/` (the workspace index)
+and `task-board/` are not referenced by any step, on either platform.
+
+Two more things it refuses to do quietly:
+
+- **It will not downgrade a newer DSH.** The pin is `0.1.1-rc.2`; if the machine has
+  something newer, that is kept and reported. `--allow-downgrade` forces the pin.
+- **It will not start a second Qwen bridge.** If `127.0.0.1:3083` already answers, it
+  skips registering its own LaunchAgent / Scheduled Task and names the agent that
+  already owns the port — two supervisors on one port means the loser
+  `EADDRINUSE`-loops forever.
+
 ## Credentials and endpoints
 
 Nothing is baked into the repo — not the keys, and not the addresses of your own

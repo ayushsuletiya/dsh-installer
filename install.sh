@@ -48,6 +48,9 @@ DRY_RUN=0
 SKIP_QWEN=0
 SKIP_PATCH=0
 SKIP_PROFILE_INSTALL=0
+REPLACE_CONFIG=0
+KEEP_CONFIG=0
+ALLOW_DOWNGRADE=0
 
 # ── output (bash 3.2 has no safe empty-array expansion, so: counters + text) ─
 
@@ -87,6 +90,9 @@ while [ $# -gt 0 ]; do
     --skip-qwen) SKIP_QWEN=1; shift ;;
     --skip-patch) SKIP_PATCH=1; shift ;;
     --skip-profile-install) SKIP_PROFILE_INSTALL=1; shift ;;
+    --replace-config) REPLACE_CONFIG=1; shift ;;
+    --keep-config) KEEP_CONFIG=1; shift ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
     --dsh-version) DSH_PKG_VERSION="${2:?}"; shift 2 ;;
     -h|--help) sed -n '2,26p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -115,6 +121,39 @@ printf '%s  payload: %s%s\n' "$C_DIM" "$SRC_DIR" "$C_RESET"
 printf '%s  target:  %s%s\n' "$C_DIM" "$DSH_HOME_DIR" "$C_RESET"
 if [ "$DRY_RUN" = 1 ]; then
   printf '%s  DRY RUN — nothing will be written%s\n' "$C_YELLOW" "$C_RESET"
+fi
+
+# ── existing installation guard ──────────────────────────────────────────────
+
+# This installer WRITES settings.yaml, .credentials.yaml, .env, the web profile's
+# package.json and cordis.patch.yml. On a machine that already has a DSH setup that
+# means replacing that person's providers, plugin list and MCP rows — so it stops
+# and makes the choice explicit instead of silently taking over.
+#
+# Chat history is never involved: sessions/, storages/ and task-board/ are not
+# touched by any step, and every file that IS replaced is copied to
+# <name>.bak.<timestamp> first.
+EXISTING=""
+[ -f "$DSH_HOME_DIR/settings.yaml" ] && EXISTING="$EXISTING  $DSH_HOME_DIR/settings.yaml
+"
+[ -f "$DSH_HOME_DIR/.credentials.yaml" ] && EXISTING="$EXISTING  $DSH_HOME_DIR/.credentials.yaml
+"
+[ -f "$PROFILE_DIR/package.json" ] && EXISTING="$EXISTING  $PROFILE_DIR/package.json (your plugin list)
+"
+[ -f "$PROFILE_DIR/cordis.patch.yml" ] && EXISTING="$EXISTING  $PROFILE_DIR/cordis.patch.yml (your MCP rows)
+"
+
+if [ -n "$EXISTING" ] && [ "$KEEP_CONFIG" = 0 ] && [ "$REPLACE_CONFIG" = 0 ] && [ "$DRY_RUN" = 0 ]; then
+  printf '\n%sThis machine already has a DeepSeek Harness setup.%s\n\n' "$C_BOLD$C_YELLOW" "$C_RESET"
+  printf 'These files would be REPLACED (each one backed up to .bak.%s first):\n' "$STAMP"
+  printf '%s' "$EXISTING"
+  printf '\nYour chats are safe either way — sessions, workspace index and task board\nare never touched.\n\n'
+  printf 'Pick one:\n'
+  printf '  %s--replace-config%s   take over this setup (backups are kept)\n' "$C_BOLD" "$C_RESET"
+  printf '  %s--keep-config%s      leave every config file alone; install only the runtime,\n' "$C_BOLD" "$C_RESET"
+  printf '                     the Qwen bridge, the AgentRouter proxy and the patches\n'
+  printf '  %sDSH_HOME=~/.dsh-new%s  install side by side, touching nothing\n\n' "$C_BOLD" "$C_RESET"
+  exit 2
 fi
 
 OS="$(uname -s)"
@@ -184,10 +223,39 @@ CURRENT_DSH=""
 if command -v dsh >/dev/null 2>&1; then
   CURRENT_DSH="$(dsh --version 2>/dev/null || true)"
 fi
+# A pinned version must never quietly DOWNGRADE a working install: someone on a
+# newer dsh keeps it, and the model-picker patch simply reports that it has no
+# pinned bundle for that version. `--allow-downgrade` forces the pin.
+newer_than_pin() {
+  [ -z "$1" ] && return 1
+  node -e '
+    const cmp = (a, b) => {
+      const norm = (v) => String(v).replace(/^v/, "").split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
+      const A = norm(a), B = norm(b);
+      for (let i = 0; i < Math.max(A.length, B.length); i++) {
+        const x = A[i], y = B[i];
+        if (x === y) continue;
+        if (x === undefined) return -1;
+        if (y === undefined) return 1;
+        if (typeof x === typeof y) return x > y ? 1 : -1;
+        return typeof x === "number" ? 1 : -1;
+      }
+      return 0;
+    };
+    process.exit(cmp(process.argv[1], process.argv[2]) > 0 ? 0 : 1);
+  ' "$1" "$2" 2>/dev/null
+}
+
 if [ "$CURRENT_DSH" = "$DSH_PKG_VERSION" ]; then
   ok "dsh $DSH_PKG_VERSION already installed"
+elif [ -n "$CURRENT_DSH" ] && [ "$ALLOW_DOWNGRADE" = 0 ] && newer_than_pin "$CURRENT_DSH" "$DSH_PKG_VERSION"; then
+  warn "keeping your newer dsh $CURRENT_DSH (this installer pins $DSH_PKG_VERSION; use --allow-downgrade to force it)"
 else
-  info "npm install -g @deepseek-ai/dsh@$DSH_PKG_VERSION"
+  if [ -n "$CURRENT_DSH" ]; then
+    info "replacing dsh $CURRENT_DSH with the pinned $DSH_PKG_VERSION"
+  else
+    info "npm install -g @deepseek-ai/dsh@$DSH_PKG_VERSION"
+  fi
   run npm install -g "@deepseek-ai/dsh@$DSH_PKG_VERSION" >/dev/null 2>&1 \
     || die "could not install @deepseek-ai/dsh@$DSH_PKG_VERSION"
   ok "dsh $(dsh --version 2>/dev/null || echo installed)"
@@ -298,6 +366,10 @@ backup() {
 
 run mkdir -p "$DSH_HOME_DIR/logs" "$PRESET_DIR" "$INSTALLER_HOME"
 
+if [ "$KEEP_CONFIG" = 1 ]; then
+  info "--keep-config: settings.yaml, .credentials.yaml and .env left untouched"
+else
+
 backup "$DSH_HOME_DIR/settings.yaml"
 # settings.yaml is rendered, not copied: the gateway addresses live in the secrets
 # file, and a provider whose endpoint is blank is dropped rather than left pointing
@@ -346,9 +418,15 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 ok ".env (0600)"
 
+fi  # KEEP_CONFIG
+
 # ── 5. web profile ──────────────────────────────────────────────────────────
 
 step "Web profile: bundles, local plugins, MCP rows"
+
+if [ "$KEEP_CONFIG" = 1 ]; then
+  info "--keep-config: your profile, plugin list and MCP rows left untouched"
+else
 
 # Let dsh scaffold the profile skeleton first, so cordis.yml / pnpm-workspace.yaml
 # always match the installed dsh version instead of a copy that can drift.
@@ -425,17 +503,23 @@ else
   info "plugin install skipped"
 fi
 
+fi  # KEEP_CONFIG
+
 # ── 6. agent preset ─────────────────────────────────────────────────────────
 
 step "Agent preset: opus-qwen"
 
-run cp "$SRC_DIR/payload/agent-presets/opus-qwen/preset.yml" "$PRESET_DIR/preset.yml"
-if [ "$DRY_RUN" = 0 ]; then
-  node "$SRC_DIR/tools/render.mjs" \
-    "$SRC_DIR/payload/agent-presets/opus-qwen/agent.cordis.template.yml" \
-    "$PRESET_DIR/agent.cordis.yml" >/dev/null || die "rendering the agent preset failed"
+if [ "$KEEP_CONFIG" = 1 ]; then
+  info "--keep-config: agent presets left untouched"
+else
+  run cp "$SRC_DIR/payload/agent-presets/opus-qwen/preset.yml" "$PRESET_DIR/preset.yml"
+  if [ "$DRY_RUN" = 0 ]; then
+    node "$SRC_DIR/tools/render.mjs" \
+      "$SRC_DIR/payload/agent-presets/opus-qwen/agent.cordis.template.yml" \
+      "$PRESET_DIR/agent.cordis.yml" >/dev/null || die "rendering the agent preset failed"
+  fi
+  ok "Opus thinks · qwen_code writes · subagent_qwen drives the files"
 fi
-ok "Opus thinks · qwen_code writes · subagent_qwen drives the files"
 
 # ── 7. model picker patches ─────────────────────────────────────────────────
 
@@ -539,7 +623,21 @@ else
     fi
 
     PLIST="$HOME/Library/LaunchAgents/com.dsh.qwen-bridge.plist"
-    if [ "$DRY_RUN" = 0 ]; then
+    # Someone who already runs a bridge (their own LaunchAgent, a nohup'd run.sh)
+    # must not end up with two supervisors fighting over port 3083 — the loser
+    # EADDRINUSE-loops forever. If the port already answers, leave it alone.
+    BRIDGE_ALREADY=0
+    if [ "$DRY_RUN" = 0 ] && curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:3083/health 2>/dev/null; then
+      BRIDGE_ALREADY=1
+      OTHER_AGENTS="$(ls "$HOME/Library/LaunchAgents" 2>/dev/null \
+        | grep -iE 'qwen' | grep -v '^com\.dsh\.qwen-bridge\.plist$' | tr '\n' ' ')"
+      if [ -n "$OTHER_AGENTS" ]; then
+        warn "a Qwen bridge is already serving :3083 (LaunchAgent: $OTHER_AGENTS) — not registering a second one"
+      else
+        warn "something already serves :3083 — not registering a second bridge"
+      fi
+    fi
+    if [ "$DRY_RUN" = 0 ] && [ "$BRIDGE_ALREADY" = 0 ]; then
       mkdir -p "$HOME/Library/LaunchAgents"
       cat > "$PLIST" <<PLI
 <?xml version="1.0" encoding="UTF-8"?>

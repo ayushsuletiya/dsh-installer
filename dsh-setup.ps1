@@ -44,7 +44,7 @@ switch ($Command.ToLowerInvariant()) {
 
   'reconfigure' {
     # Not $args — that is an automatic variable in PowerShell.
-    $installArgs = @('-SkipQwen', '-SkipProfileInstall')
+    $installArgs = @('-ReplaceConfig', '-SkipQwen', '-SkipProfileInstall')
     if ($Secrets) { $installArgs += @('-Secrets', $Secrets) }
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Here 'install.ps1') @installArgs
     exit $LASTEXITCODE
@@ -193,7 +193,7 @@ switch ($Command.ToLowerInvariant()) {
       Warn "payload at $Here is not a git clone; re-run install.ps1 from the repo"
       exit 1
     }
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Here 'install.ps1') -SkipQwen
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Here 'install.ps1') -ReplaceConfig -SkipQwen
     exit $LASTEXITCODE
   }
 
