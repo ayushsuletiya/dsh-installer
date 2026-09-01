@@ -129,6 +129,54 @@ function Test-CommandExists($name) {
   $null -ne (Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+# ── running external tools ──────────────────────────────────────────────────
+#
+# Windows PowerShell turns anything a native command writes to stderr into error
+# records as soon as a redirection is involved, and $ErrorActionPreference =
+# 'Stop' then promotes those to terminating errors. That is how ONE npm
+# deprecation warning killed this installer: npm printed a warning, exited 0, and
+# PowerShell threw. So every external tool is invoked through these three, with
+# 'Stop' suspended for the duration, and only the exit code decides anything.
+
+# Discard all output; return the exit code.
+function Invoke-Native([string]$File, [string[]]$Arguments = @(), [string]$Log = '') {
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    if ($Log) { & $File @Arguments *> $Log } else { & $File @Arguments *> $null }
+    if ($null -eq $LASTEXITCODE) { return 0 }
+    return $LASTEXITCODE
+  } catch {
+    return 1
+  } finally { $ErrorActionPreference = $old }
+}
+
+# Show the tool's own progress, indented; return the exit code.
+function Invoke-NativeShow([string]$File, [string[]]$Arguments = @()) {
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $File @Arguments 2>&1 | ForEach-Object { Write-Host ("      {0}" -f $_) }
+    if ($null -eq $LASTEXITCODE) { return 0 }
+    return $LASTEXITCODE
+  } catch {
+    return 1
+  } finally { $ErrorActionPreference = $old }
+}
+
+# Trimmed stdout of a tool, or '' when it could not run.
+function Get-NativeOut([string]$File, [string[]]$Arguments = @()) {
+  if (-not $File) { return '' }
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $lines = @(& $File @Arguments 2>$null)
+    return (($lines | Where-Object { $_ } | ForEach-Object { "$_" }) -join "`n").Trim()
+  } catch {
+    return ''
+  } finally { $ErrorActionPreference = $old }
+}
+
 # ── 0. locate the payload (clone ourselves when piped from irm) ──────────────
 
 $SrcDir = ''
@@ -160,8 +208,9 @@ if (-not $SrcDir -or -not (Test-Path -LiteralPath (Join-Path $SrcDir 'payload'))
   if (-not $ok) {
     if (-not (Test-CommandExists 'git')) { Die "could not download the payload from $RepoUrl and git is not available" }
     Remove-Item -LiteralPath $CloneDir -Recurse -Force -ErrorAction SilentlyContinue
-    & git clone --depth 1 --branch $RepoBranch $RepoUrl $CloneDir 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "could not fetch the payload from $RepoUrl" }
+    if ((Invoke-Native 'git' @('clone', '--depth', '1', '--branch', $RepoBranch, $RepoUrl, $CloneDir)) -ne 0) {
+      Die "could not fetch the payload from $RepoUrl"
+    }
   }
   $SrcDir = $CloneDir
 }
@@ -261,19 +310,19 @@ function Get-NodeMajor {
   # expression reached node as broken JavaScript, node exited with a syntax error,
   # and a perfectly good node looked like no node at all.
   try {
-    $v = (& $exe -v 2>$null | Where-Object { $_ } | Select-Object -First 1)
-    if ("$v" -match '^v?(\d+)') { return [int]$matches[1] }
+    $v = Get-NativeOut $exe @('-v')
+    if ($v -match '^v?(\d+)') { return [int]$matches[1] }
     return 0
   } catch { return 0 }
 }
 
 # Same quoting trap, general form: any JavaScript with a double quote in it has to
 # reach node as a FILE, never as -e / -p on the command line.
-function Invoke-NodeScript([string]$js, [string[]]$nodeArgs) {
+function Invoke-NodeScript([string]$js, [string[]]$nodeArgs = @()) {
   $f = Join-Path $env:TEMP ("dsh-node-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".mjs")
   Set-Content -LiteralPath $f -Value $js -Encoding ASCII
   try {
-    if ($nodeArgs) { & $NodeBin $f @nodeArgs } else { & $NodeBin $f }
+    return (Invoke-Native $NodeBin (@($f) + $nodeArgs))
   } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
@@ -290,8 +339,8 @@ function Set-NodeTooling {
   $script:GlobalBin = ''
   if ($script:NpmCmd) {
     try {
-      $p = (& $script:NpmCmd prefix -g 2>$null | Where-Object { $_ } | Select-Object -First 1)
-      if ($p) { $script:GlobalBin = "$p".Trim() }
+      $p = Get-NativeOut $script:NpmCmd @('prefix', '-g')
+      if ($p) { $script:GlobalBin = $p }
     } catch { }
   }
   if (-not $script:GlobalBin) { $script:GlobalBin = $dir }
@@ -381,14 +430,14 @@ function Install-NodePortable {
   # Prove it runs before claiming success, then pin the absolute path: PATH
   # resolution by name cannot be trusted for the rest of this run.
   $exe = Join-Path $dest 'node.exe'
-  $reported = (& $exe -v 2>$null)
+  $reported = Get-NativeOut $exe @('-v')
   if (-not $reported) { throw "node.exe unpacked but does not run" }
   $script:NodeExe = $exe
   Add-UserPath $dest
 }
 
 if ((Get-NodeMajor) -ge $NodeMajorMin) {
-  Write-Ok ("node {0} already usable" -f (& (Resolve-NodeExe) -v))
+  Write-Ok ("node {0} already usable" -f (Get-NativeOut (Resolve-NodeExe) @('-v')))
 } else {
   if ($DryRun) {
     Write-Info "would unpack node into $env:LOCALAPPDATA\Programs\dsh-node"
@@ -403,14 +452,14 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
     }
     if (-not $installed -and (Test-CommandExists 'winget')) {
       Write-Info 'installing Node.js LTS via winget (needs Administrator)'
-      & winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements 2>$null | Out-Null
+      Invoke-Native 'winget' @('install', '--id', 'OpenJS.NodeJS.LTS', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
       Update-SessionPath
       $installed = (Get-NodeMajor) -ge $NodeMajorMin
     }
     if (-not $installed -and (Test-CommandExists 'fnm')) {
       Write-Info 'installing node via fnm'
-      & fnm install $NodeInstallVersion 2>$null | Out-Null
-      & fnm use $NodeInstallVersion 2>$null | Out-Null
+      Invoke-Native 'fnm' @('install', $NodeInstallVersion) | Out-Null
+      Invoke-Native 'fnm' @('use', $NodeInstallVersion) | Out-Null
       Update-SessionPath
       $installed = (Get-NodeMajor) -ge $NodeMajorMin
     }
@@ -431,7 +480,7 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
       }
     }
     if (-not $installed) { Die "could not install Node.js. Install it from https://nodejs.org and re-run this command." }
-    Write-Ok ("node {0} installed" -f (& (Resolve-NodeExe) -v))
+    Write-Ok ("node {0} installed" -f (Get-NativeOut (Resolve-NodeExe) @('-v')))
     Write-Info ("using {0}" -f (Resolve-NodeExe))
     $script:NodeWasInstalled = $true
   }
@@ -443,7 +492,7 @@ Set-NodeTooling
 
 $PnpmCmd = Get-ToolPath 'pnpm'
 if ($PnpmCmd) {
-  Write-Ok ("pnpm {0}" -f (& $PnpmCmd -v))
+  Write-Ok ("pnpm {0}" -f (Get-NativeOut $PnpmCmd @('-v')))
 } elseif (-not $DryRun) {
   # npm first, corepack second. A corepack pnpm shim downloads the package
   # manager on first use and asks for confirmation while doing it, which stalls
@@ -452,14 +501,14 @@ if ($PnpmCmd) {
   $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
   Write-Info 'installing pnpm'
   if ($script:NpmCmd) {
-    try { & $script:NpmCmd install -g pnpm 2>$null | Out-Null } catch { }
+    Invoke-Native $script:NpmCmd @('install', '-g', 'pnpm') | Out-Null
     $PnpmCmd = Get-ToolPath 'pnpm'
   }
   if (-not $PnpmCmd -and $script:CorepackCmd) {
-    try { & $script:CorepackCmd enable pnpm 2>$null | Out-Null } catch { }
+    Invoke-Native $script:CorepackCmd @('enable', 'pnpm') | Out-Null
     $PnpmCmd = Get-ToolPath 'pnpm'
   }
-  if ($PnpmCmd) { Write-Ok ("pnpm {0}" -f (& $PnpmCmd -v)) }
+  if ($PnpmCmd) { Write-Ok ("pnpm {0}" -f (Get-NativeOut $PnpmCmd @('-v'))) }
   else { Write-Warn 'pnpm unavailable - the plugin-bundle install will be skipped'; $SkipProfileInstall = $true }
 }
 
@@ -469,12 +518,12 @@ Write-Step "DeepSeek Harness $DshVersion"
 
 $DshCmd = Get-ToolPath 'dsh'
 $currentDsh = ''
-if ($DshCmd) { try { $currentDsh = (& $DshCmd --version 2>$null) } catch { } }
+if ($DshCmd) { $currentDsh = Get-NativeOut $DshCmd @('--version') }
 function Test-NewerVersion($have, $pin) {
   if (-not $have) { return $false }
   # Same comparison as install.sh, done in node so both platforms agree. Passed as
   # a file because this JavaScript contains double quotes.
-  Invoke-NodeScript @'
+  $cmpCode = Invoke-NodeScript @'
 const cmp = (a, b) => {
   const norm = (v) => String(v).replace(/^v/, "").split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
   const A = norm(a), B = norm(b);
@@ -489,8 +538,8 @@ const cmp = (a, b) => {
   return 0;
 };
 process.exit(cmp(process.argv[2], process.argv[3]) > 0 ? 0 : 1);
-'@ @($have, $pin) 2>$null | Out-Null
-  return ($LASTEXITCODE -eq 0)
+'@ @($have, $pin)
+  return ($cmpCode -eq 0)
 }
 
 if ($currentDsh -eq $DshVersion) {
@@ -501,16 +550,18 @@ if ($currentDsh -eq $DshVersion) {
   Write-Info "npm install -g @deepseek-ai/dsh@$DshVersion"
   if (-not $DryRun) {
     if (-not $script:NpmCmd) { Die 'npm was not found next to node - cannot install dsh' }
-    & $script:NpmCmd install -g "@deepseek-ai/dsh@$DshVersion" 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "could not install @deepseek-ai/dsh@$DshVersion" }
+    $npmLog = Join-Path $env:TEMP 'dsh-npm-install.log'
+    if ((Invoke-Native $script:NpmCmd @('install', '-g', "@deepseek-ai/dsh@$DshVersion") $npmLog) -ne 0) {
+      Die "could not install @deepseek-ai/dsh@$DshVersion - see $npmLog"
+    }
     $DshCmd = Get-ToolPath 'dsh'
     if (-not $DshCmd) { Die "dsh installed but its shim was not found in $script:GlobalBin" }
-    Write-Ok ("dsh {0}" -f (& $DshCmd --version 2>$null))
+    Write-Ok ("dsh {0}" -f (Get-NativeOut $DshCmd @('--version')))
   }
 }
 if (-not $DryRun -and $script:NpmCmd) {
-  $root = (& $script:NpmCmd root -g 2>$null | Where-Object { $_ } | Select-Object -First 1)
-  if ($root) { $env:NPM_GLOBAL_ROOT = "$root".Trim() }
+  $root = Get-NativeOut $script:NpmCmd @('root', '-g')
+  if ($root) { $env:NPM_GLOBAL_ROOT = $root }
 }
 
 # ── 3. credentials ──────────────────────────────────────────────────────────
@@ -638,8 +689,9 @@ $env:DSHX_TABITOKEN_BASE_URL = $Secret['TABITOKEN_BASE_URL']
 $env:DSHX_OMNIROUTE_BASE_URL = $Secret['OMNIROUTE_BASE_URL']
 $env:DSHX_QWEN_OMNI_NODE_ID  = $Secret['QWEN_OMNI_NODE_ID']
 if (-not $DryRun) {
-  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\settings.template.yaml') $settingsPath | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die 'rendering settings.yaml failed' }
+  if ((Invoke-Native $NodeBin @((Join-Path $SrcDir 'tools\render.mjs'), (Join-Path $SrcDir 'payload\settings.template.yaml'), $settingsPath)) -ne 0) {
+    Die 'rendering settings.yaml failed'
+  }
 }
 Protect-File $settingsPath
 $providerCount = if ($DryRun) { '?' } else {
@@ -686,7 +738,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'cordis.yml')) -and -not
   Write-Info 'scaffolding the profile with dsh itself'
   $env:DSH_HOME = $DshHome
   if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
-  if ($DshCmd) { try { & $DshCmd --profile web --dump-default-config 2>$null | Out-Null } catch { } }
+  if ($DshCmd) { Invoke-Native $DshCmd @('--profile', 'web', '--dump-default-config') | Out-Null }
 }
 
 Invoke-Step {
@@ -697,11 +749,11 @@ Invoke-Step {
 # whole install fails and none of the ten bundles land. Windows ships no git.
 if (-not $DryRun) {
   $gitWorks = $false
-  try { & git --version 2>$null | Out-Null; $gitWorks = ($LASTEXITCODE -eq 0) } catch { $gitWorks = $false }
+  $gitWorks = ((Invoke-Native 'git' @('--version')) -eq 0)
   if ($gitWorks) {
     Write-Ok 'git available - keeping the pinned dsh-at-file tag'
   } else {
-    Invoke-NodeScript @'
+    $swapCode = Invoke-NodeScript @'
 import fs from "node:fs";
 const file = process.argv[2];
 const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -710,8 +762,9 @@ for (const [name, spec] of Object.entries(pkg.dependencies || {})) {
   if (typeof spec === "string" && /^(github:|git\+|git:)/.test(spec)) { pkg.dependencies[name] = "*"; swapped += 1; }
 }
 if (swapped) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
-'@ @((Join-Path $ProfileDir 'package.json')) 2>$null | Out-Null
-    Write-Warn 'no working git - git-pinned bundles fall back to their npm release'
+'@ @((Join-Path $ProfileDir 'package.json'))
+    if ($swapCode -eq 0) { Write-Warn 'no working git - git-pinned bundles fall back to their npm release' }
+    else { Write-Warn 'no working git, and the fallback rewrite failed - the bundle install may fail' }
   }
 }
 foreach ($f in @('compaction-llm-retry.mjs','web-search-ddg.mjs','llm-turn-fallback.mjs','qwen-coder.mjs','command-clear.mjs')) {
@@ -724,7 +777,7 @@ Write-Ok '5 local plugins + 10 bundle declarations'
 # Forward slashes throughout: Node accepts them on Windows, and they need no
 # escaping inside YAML strings or the `!!js` expressions.
 function ToFwd($p) { return ($p -replace '\\', '/') }
-function JsonStr($p) { return (& $NodeBin -p 'JSON.stringify(process.argv[1])' $p) }
+function JsonStr($p) { return (Get-NativeOut $NodeBin @('-p', 'JSON.stringify(process.argv[1])', $p)) }
 
 $env:DSHX_PROFILE_WEB = ToFwd $ProfileDir
 $env:DSHX_DSH_HOME    = ToFwd $DshHome
@@ -753,8 +806,9 @@ if (Test-Path -LiteralPath $mlServer) {
 $patchPath = Join-Path $ProfileDir 'cordis.patch.yml'
 if (-not $DryRun) {
   Backup-File $patchPath
-  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\profile-web\cordis.patch.template.yml') $patchPath | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die 'rendering cordis.patch.yml failed' }
+  if ((Invoke-Native $NodeBin @((Join-Path $SrcDir 'tools\render.mjs'), (Join-Path $SrcDir 'payload\profile-web\cordis.patch.template.yml'), $patchPath)) -ne 0) {
+    Die 'rendering cordis.patch.yml failed'
+  }
 }
 Write-Ok 'cordis.patch.yml rendered for this machine'
 
@@ -768,8 +822,9 @@ Write-Info 'UI Skills MCP: always on (keyless)'
 # package installed — so this is handled in one place for both platforms.
 $wsPath = Join-Path $ProfileDir 'pnpm-workspace.yaml'
 if (-not $DryRun -and (Test-Path -LiteralPath $wsPath)) {
-  & $NodeBin (Join-Path $SrcDir 'tools\pnpm-allow-builds.mjs') $wsPath 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) { Write-Warn 'could not write pnpm build approvals' }
+  if ((Invoke-Native $NodeBin @((Join-Path $SrcDir 'tools\pnpm-allow-builds.mjs'), $wsPath)) -ne 0) {
+    Write-Warn 'could not write pnpm build approvals'
+  }
 }
 
 if (-not $SkipProfileInstall -and -not $DryRun) {
@@ -780,8 +835,7 @@ if (-not $SkipProfileInstall -and -not $DryRun) {
   try {
     $env:DSH_HOME = $DshHome
     # dsh shells out to pnpm, which the child finds through the inherited PATH.
-    & $DshCmd plugin --profile web install *> $log
-    if ($LASTEXITCODE -eq 0) { Write-Ok 'plugin bundles installed' }
+    if ((Invoke-Native $DshCmd @('plugin', '--profile', 'web', 'install') $log) -eq 0) { Write-Ok 'plugin bundles installed' }
     else { Write-Warn "plugin install reported errors - see $log" }
   } finally { Pop-Location }
 } else {
@@ -801,10 +855,12 @@ Invoke-Step {
   Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\preset.yml') -Destination (Join-Path $PresetDir 'preset.yml') -Force
 } 'copy preset.yml'
 if (-not $DryRun) {
-  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') `
-    (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\agent.cordis.template.yml') `
-    (Join-Path $PresetDir 'agent.cordis.yml') | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die 'rendering the agent preset failed' }
+  $presetCode = Invoke-Native $NodeBin @(
+    (Join-Path $SrcDir 'tools\render.mjs'),
+    (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\agent.cordis.template.yml'),
+    (Join-Path $PresetDir 'agent.cordis.yml')
+  )
+  if ($presetCode -ne 0) { Die 'rendering the agent preset failed' }
 }
 Write-Ok 'Opus thinks - qwen_code writes - subagent_qwen drives the files'
 }  # KeepConfig
@@ -818,8 +874,8 @@ if ($SkipPatch) {
 } elseif ($DryRun) {
   Write-Info 'would patch @deepseek-ai/dsh-client-ui-model-selection'
 } else {
-  & $NodeBin (Join-Path $SrcDir 'tools\patch-model-selector.mjs')
-  if ($LASTEXITCODE -eq 4) { Write-Warn 'model-picker patch skipped (the picker still works, without folding)' }
+  $patchCode = Invoke-NativeShow $NodeBin @((Join-Path $SrcDir 'tools\patch-model-selector.mjs'))
+  if ($patchCode -eq 4) { Write-Warn 'model-picker patch skipped (the picker still works, without folding)' }
 }
 
 # ── 7b. AgentRouter loopback proxy ──────────────────────────────────────────
@@ -877,8 +933,8 @@ if ($SkipQwen) {
   Write-Ok "bridge installed at $BridgeDir"
 
   if (-not $DryRun) {
-    & $NodeBin (Join-Path $SrcDir 'tools\install-qwen-app.mjs')
-    if ($LASTEXITCODE -ne 0) {
+    $qwenCode = Invoke-NativeShow $NodeBin @((Join-Path $SrcDir 'tools\install-qwen-app.mjs'))
+    if ($qwenCode -ne 0) {
       Write-Warn 'Qwen app not installed automatically - get it from https://qwen.ai/download'
     } else {
       Write-Ok 'Qwen desktop app installed and launched with the debugging port'
@@ -1005,7 +1061,7 @@ if (-not $DryRun -and ($SrcDir -ne $InstallerHome)) {
 if (-not $DryRun) {
   if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
   try {
-    $v = if ($DshCmd) { (& $DshCmd --version 2>$null) } else { '' }
+    $v = if ($DshCmd) { Get-NativeOut $DshCmd @('--version') } else { '' }
     if ($v) { Write-Ok "dsh $v responds" } else { Write-Warn 'dsh --version failed'; $script:Failed = 1 }
   } catch { Write-Warn 'dsh --version failed'; $script:Failed = 1 }
 
@@ -1022,8 +1078,8 @@ if (-not $DryRun) {
   } elseif ($DshCmd) {
     $dumpLog = Join-Path $env:TEMP 'dsh-dump-config.log'
     $env:DSH_HOME = $DshHome
-    & $DshCmd --profile web --dump-config *> $dumpLog
-    if ($LASTEXITCODE -eq 0) {
+    $dumpCode = Invoke-Native $DshCmd @('--profile', 'web', '--dump-config') $dumpLog
+    if ($dumpCode -eq 0) {
       $rows = (Select-String -Path $dumpLog -Pattern '^- id:' -AllMatches).Count
       Write-Ok "composed web profile parses ($rows top-level rows)"
     } else {

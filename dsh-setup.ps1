@@ -21,6 +21,28 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Windows PowerShell turns a native command's stderr into error records as soon as
+# it is redirected, and 'Stop' then makes a harmless npm warning fatal. Every
+# external tool goes through these two, with 'Stop' suspended for the call.
+function Invoke-Native([string]$File, [string[]]$Arguments = @()) {
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $File @Arguments
+    if ($null -eq $LASTEXITCODE) { return 0 }
+    return $LASTEXITCODE
+  } catch { return 1 } finally { $ErrorActionPreference = $old }
+}
+function Get-NativeOut([string]$File, [string[]]$Arguments = @()) {
+  if (-not $File) { return '' }
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $lines = @(& $File @Arguments 2>$null)
+    return (($lines | Where-Object { $_ } | ForEach-Object { "$_" }) -join "`n").Trim()
+  } catch { return '' } finally { $ErrorActionPreference = $old }
+}
+
 $Here      = Split-Path -Parent $PSCommandPath
 $UserHome  = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $DshHome   = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $UserHome '.dsh' }
@@ -40,6 +62,28 @@ function Test-Http($url, $timeout = 3) {
   catch { return $false }
 }
 
+# The installer may have put node under the user's own profile, which is not on
+# PATH in every shell, so look there as well as on PATH.
+function Resolve-Node {
+  $cmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { return $cmd.Source }
+  if ($env:LOCALAPPDATA) {
+    $c = Join-Path $env:LOCALAPPDATA 'Programs\dsh-node\node.exe'
+    if (Test-Path -LiteralPath $c) { return $c }
+  }
+  return 'node'
+}
+function Resolve-Npm {
+  $node = Resolve-Node
+  if ($node -ne 'node') {
+    $c = Join-Path (Split-Path -Parent $node) 'npm.cmd'
+    if (Test-Path -LiteralPath $c) { return $c }
+  }
+  $cmd = Get-Command npm -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { return $cmd.Source }
+  return ''
+}
+
 switch ($Command.ToLowerInvariant()) {
 
   'reconfigure' {
@@ -51,13 +95,11 @@ switch ($Command.ToLowerInvariant()) {
   }
 
   'repatch' {
-    & node (Join-Path $Here 'tools\patch-model-selector.mjs')
-    exit $LASTEXITCODE
+    exit (Invoke-Native (Resolve-Node) @((Join-Path $Here 'tools\patch-model-selector.mjs')))
   }
 
   'qwen' {
-    & node (Join-Path $Here 'tools\install-qwen-app.mjs')
-    exit $LASTEXITCODE
+    exit (Invoke-Native (Resolve-Node) @((Join-Path $Here 'tools\install-qwen-app.mjs')))
   }
 
   'bridge' {
@@ -95,8 +137,8 @@ switch ($Command.ToLowerInvariant()) {
     foreach ($c in @('node','pnpm','dsh')) {
       $cmd = Get-Command $c -ErrorAction SilentlyContinue
       if ($cmd) {
-        $v = try { (& $c --version 2>$null) } catch { '' }
-        if (-not $v -and $c -eq 'node') { $v = (& node -v) }
+        $v = Get-NativeOut $cmd.Source @('--version')
+        if (-not $v) { $v = Get-NativeOut $cmd.Source @('-v') }
         Ok ("{0} {1}" -f $c, $v)
       } else {
         if ($c -eq 'pnpm') { Warn "$c missing" } else { Bad "$c missing" }
@@ -155,7 +197,7 @@ switch ($Command.ToLowerInvariant()) {
     } else { Bad 'opus-qwen preset missing' }
 
     Head 'model picker'
-    $root = try { (& npm root -g 2>$null) } catch { '' }
+    $root = Get-NativeOut (Resolve-Npm) @('root', '-g')
     if ($root) {
       $sel = Join-Path $root '@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-client-ui-model-selection\lib\client.js'
       if (Test-Path -LiteralPath $sel) {
@@ -188,7 +230,10 @@ switch ($Command.ToLowerInvariant()) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Bad 'git required'; exit 1 }
     if (Test-Path -LiteralPath (Join-Path $Here '.git')) {
       Push-Location $Here
-      try { & git pull --ff-only; Ok 'payload updated' } finally { Pop-Location }
+      try {
+        if ((Invoke-Native 'git' @('pull', '--ff-only')) -eq 0) { Ok 'payload updated' }
+        else { Bad 'git pull failed'; Pop-Location; exit 1 }
+      } finally { Pop-Location }
     } else {
       Warn "payload at $Here is not a git clone; re-run install.ps1 from the repo"
       exit 1
