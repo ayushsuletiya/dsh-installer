@@ -31,6 +31,7 @@ const PUBLIC_BASE = process.env.DIST_PUBLIC_BASE || "https://get.xovi.pro";
 const ADMIN_TOKEN = process.env.DIST_ADMIN_TOKEN || "";
 
 const PAYLOAD_DIR = path.join(ROOT, "payloads");
+const REPORT_DIR = path.join(ROOT, "reports");
 const STATE_FILE = path.join(ROOT, "state.json");
 const LOG_FILE = process.env.DIST_LOG || path.join(ROOT, "dist.log");
 
@@ -257,6 +258,113 @@ configuration over TLS at install time and on every update, so no credential fil
 is ever copied by hand.
 `;
 
+// ---------- windows diagnostic ----------
+// One line for the human: it inspects the running web UI the way the browser
+// does, then posts the findings here. Nothing to read, nothing to paste.
+
+function diagPs1(token) {
+  return `# DeepSeek Harness - Windows diagnostic. Reports back automatically.
+& {
+  $ErrorActionPreference = 'Continue'
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
+  $lines = New-Object System.Collections.Generic.List[string]
+  function A($t) { $lines.Add("$t") | Out-Null; Write-Host $t }
+
+  A ("dsh-diag " + (Get-Date -Format s) + "  ps " + $PSVersionTable.PSVersion + "  os " + [Environment]::OSVersion.Version)
+
+  # what is listening on 3080, and which processes think they are dsh
+  try {
+    $conns = Get-NetTCPConnection -LocalPort 3080 -State Listen -ErrorAction Stop
+    foreach ($c in $conns) { A ("listen 3080 pid " + $c.OwningProcess) }
+  } catch { A "listen 3080 none" }
+  $procs = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+             Where-Object { $_.CommandLine -and $_.CommandLine -match 'dsh' })
+  A ("dsh node processes " + $procs.Count)
+  foreach ($p in $procs) {
+    $cl = "$($p.CommandLine)"
+    if ($cl.Length -gt 150) { $cl = $cl.Substring(0, 150) }
+    A ("  pid " + $p.ProcessId + " | " + $cl)
+  }
+
+  foreach ($t in @('DSH Web', 'DSH Qwen Bridge', 'DSH AgentRouter Proxy', 'DSH Update Check')) {
+    try { $ts = Get-ScheduledTask -TaskName $t -ErrorAction Stop; A ("task '" + $t + "' " + $ts.State) }
+    catch { A ("task '" + $t + "' MISSING") }
+  }
+
+  # the page, and the plugin bundles it asks the browser to load
+  $html = ''
+  try {
+    $r = Invoke-WebRequest -Uri 'http://127.0.0.1:3080/' -TimeoutSec 15 -UseBasicParsing
+    $html = "$($r.Content)"
+    A ("index " + $r.StatusCode + " " + $html.Length + "b")
+  } catch { A ("index FAILED " + $_.Exception.Message) }
+
+  if ($html) {
+    $k = 'globalThis["__DSH_BOOT__"] = '
+    $i = $html.IndexOf($k)
+    if ($i -lt 0) { A "boot manifest NOT FOUND in index" }
+    else {
+      $s = $i + $k.Length; $d = 0; $e = $s
+      for (; $e -lt $html.Length; $e++) {
+        $ch = $html[$e]
+        if ($ch -eq '{') { $d++ } elseif ($ch -eq '}') { $d--; if ($d -eq 0) { $e++; break } }
+      }
+      $boot = $null
+      try { $boot = $html.Substring($s, $e - $s) | ConvertFrom-Json } catch { A ("boot parse failed " + $_.Exception.Message) }
+      if ($boot) {
+        $entries = @($boot.entries)
+        A ("boot rev " + $boot.rev + " entries " + $entries.Count)
+        $ok = 0; $bad = 0
+        foreach ($en in $entries) {
+          $u = 'http://127.0.0.1:3080' + $en.url
+          try {
+            $br = Invoke-WebRequest -Uri $u -TimeoutSec 15 -UseBasicParsing
+            if ($br.StatusCode -eq 200) { $ok++ } else { $bad++; A ("  BAD " + $en.id + " -> " + $br.StatusCode) }
+          } catch {
+            $bad++
+            $code = ''
+            try { $code = "$($_.Exception.Response.StatusCode.value__)" } catch {}
+            if ($bad -le 6) { A ("  BAD " + $en.id + " -> " + $code + " " + $_.Exception.Message) }
+          }
+        }
+        A ("bundles ok " + $ok + " bad " + $bad)
+      }
+    }
+  }
+
+  # where dsh and its plugins actually live
+  $npmBin = Join-Path $env:APPDATA 'npm'
+  A ("global bin " + $npmBin + " exists " + (Test-Path -LiteralPath $npmBin))
+  $profileNm = Join-Path $env:USERPROFILE '.dsh\\profiles\\web\\node_modules'
+  A ("profile node_modules exists " + (Test-Path -LiteralPath $profileNm))
+  foreach ($rel in @('@deepseek-ai\\dsh-typert-registry\\lib\\client.js')) {
+    foreach ($root in @((Join-Path $npmBin 'node_modules\\@deepseek-ai\\dsh\\node_modules'), $profileNm, (Join-Path $env:USERPROFILE '.dsh\\profiles\\node_modules'))) {
+      $p = Join-Path $root $rel
+      if (Test-Path -LiteralPath $p) { A ("found " + $p + " " + (Get-Item -LiteralPath $p).Length + "b") }
+    }
+  }
+
+  $log = Join-Path $env:USERPROFILE '.dsh\\logs'
+  if (Test-Path -LiteralPath $log) {
+    $newest = Get-ChildItem -LiteralPath $log -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest) {
+      A ("--- tail " + $newest.Name)
+      foreach ($l in (Get-Content -LiteralPath $newest.FullName -Tail 25 -ErrorAction SilentlyContinue)) { A ("  " + $l) }
+    }
+  }
+
+  try {
+    Invoke-RestMethod -Uri '${PUBLIC_BASE}/report/${token}' -Method Post -Body ($lines -join "\`n") -ContentType 'text/plain; charset=utf-8' -TimeoutSec 30 | Out-Null
+    Write-Host ''
+    Write-Host 'Sent. Nothing to copy.' -ForegroundColor Green
+  } catch {
+    Write-Host ''
+    Write-Host ('Could not send the report: ' + $_.Exception.Message) -ForegroundColor Yellow
+  }
+}
+`;
+}
+
 // ---------- routes ----------
 
 const server = http.createServer(async (req, res) => {
@@ -305,7 +413,30 @@ const server = http.createServer(async (req, res) => {
 
     // A machine's own configuration. This is the whole point: keys travel over
     // TLS to an enrolled machine, never through a file the human carries.
-    m = /^\/config\/([A-Za-z0-9_-]{8,64})$/.exec(route);
+    // A one-line Windows diagnostic that posts its own findings back, so the
+    // human runs one command and copies nothing.
+    m = /^\/diag\/([A-Za-z0-9_-]{8,64})$/.exec(route);
+    if (m && req.method === "GET") {
+      const token = m[1];
+      if (!state.tokens[token]) return send(res, 404, "unknown or revoked enrollment token\n");
+      log("diag", token.slice(0, 8), req.headers["user-agent"] || "");
+      return send(res, 200, diagPs1(token), { "content-type": "text/plain; charset=utf-8" });
+    }
+
+    m = /^\/report\/([A-Za-z0-9_-]{8,64})$/.exec(route);
+    if (m && req.method === "POST") {
+      const token = m[1];
+      if (!state.tokens[token]) return send(res, 404, { error: "unknown or revoked enrollment token" });
+      const body = (await readBody(req, 512 * 1024)).toString("utf8");
+      fs.mkdirSync(REPORT_DIR, { recursive: true });
+      const file = path.join(REPORT_DIR, `${token.slice(0, 8)}-${Date.now()}.txt`);
+      fs.writeFileSync(file, body);
+      touchToken(token, { lastReport: new Date().toISOString() });
+      log("report", token.slice(0, 8), `${body.length}b`);
+      return send(res, 200, { ok: true, bytes: body.length });
+    }
+
+
     if (m && req.method === "GET") {
       const token = m[1];
       const entry = state.tokens[token];
