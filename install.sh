@@ -30,6 +30,9 @@ set -eu
 DSH_PKG_VERSION="${DSH_PKG_VERSION:-0.1.1-rc.2}"
 NODE_MAJOR_MIN=22
 NODE_INSTALL_VERSION="${NODE_INSTALL_VERSION:-24}"
+NODE_WAS_INSTALLED=0
+NVM_LOG="${TMPDIR:-/tmp}/dsh-nvm-install.log"
+PATH_WAS_CHANGED=0
 NVM_VERSION="v0.40.1"
 REPO_URL="${DSH_INSTALLER_REPO:-https://github.com/ayushsuletiya/dsh-installer.git}"
 REPO_BRANCH="${DSH_INSTALLER_BRANCH:-main}"
@@ -68,7 +71,7 @@ MISSING_TEXT=""
 MISSING_COUNT=0
 FAILED=0
 
-step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%d/9] %s%s\n' "$C_BOLD$C_BLUE" "$STEP_NO" "$*" "$C_RESET"; }
+step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%d/10] %s%s\n' "$C_BOLD$C_BLUE" "$STEP_NO" "$*" "$C_RESET"; }
 info() { printf '      %s\n' "$*"; }
 ok()   { printf '      %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() {
@@ -169,6 +172,17 @@ if [ -n "$EXISTING" ] && [ "$KEEP_CONFIG" = 0 ] && [ "$REPLACE_CONFIG" = 0 ] && 
   exit 2
 fi
 
+# Fail on a missing secrets file NOW, not after node and dsh are already installed.
+if [ -n "$SECRETS_FILE" ] && [ ! -f "$SECRETS_FILE" ]; then
+  printf '\n%serror:%s secrets file not found: %s\n\n' "$C_RED" "$C_RESET" "$SECRETS_FILE"
+  printf 'Copy it from the machine you generated it on, e.g. from the other Mac:\n'
+  printf '  %sscp ~/Desktop/dsh-secrets.env %s@%s:~/%s\n\n' "$C_BOLD" "$(id -un)" "$(hostname -s 2>/dev/null || echo this-mac)" "$C_RESET"
+  printf 'Or install without it and add the keys later:\n'
+  printf '  %s<this same command, minus --secrets>%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %sdsh-setup reconfigure --secrets ~/dsh-secrets.env%s\n\n' "$C_BOLD" "$C_RESET"
+  exit 2
+fi
+
 OS="$(uname -s)"
 case "$OS" in
   Darwin) PLATFORM=mac ;;
@@ -200,14 +214,30 @@ else
   else
     info "installing nvm + node $NODE_INSTALL_VERSION (no sudo, nothing system-wide)"
     if [ "$DRY_RUN" = 0 ]; then
-      curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh" | bash >/dev/null 2>&1 \
-        || die "nvm install failed"
+      NVM_LOG="${TMPDIR:-/tmp}/dsh-nvm-install.log"
+      curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh" | bash >"$NVM_LOG" 2>&1 \
+        || die "nvm install failed — see $NVM_LOG"
       load_nvm
-      nvm install "$NODE_INSTALL_VERSION" >/dev/null 2>&1 || die "node install failed"
-      nvm alias default "$NODE_INSTALL_VERSION" >/dev/null 2>&1 || true
+      nvm install "$NODE_INSTALL_VERSION" >>"$NVM_LOG" 2>&1 || die "node install failed — see $NVM_LOG"
+      nvm use "$NODE_INSTALL_VERSION" >>"$NVM_LOG" 2>&1 || true
+      nvm alias default "$NODE_INSTALL_VERSION" >>"$NVM_LOG" 2>&1 || true
     fi
-    command -v node >/dev/null 2>&1 || die "node still not on PATH — open a new shell and re-run"
-    ok "node $(node -v) installed"
+    if [ "$DRY_RUN" = 1 ]; then
+      if command -v node >/dev/null 2>&1; then
+        info "would install node $NODE_INSTALL_VERSION (this machine currently has $(node -v))"
+      else
+        info "would install node $NODE_INSTALL_VERSION"
+      fi
+    else
+      command -v node >/dev/null 2>&1 || die "node still not on PATH — open a new shell and re-run"
+      # nvm can silently leave an older default selected, and everything after this
+      # point (corepack, pnpm, dsh) then fails in confusing ways. Check, do not hope.
+      if [ "$(node_major)" -lt "$NODE_MAJOR_MIN" ]; then
+        die "node $(node -v) is still active but $NODE_MAJOR_MIN+ is required — see $NVM_LOG, then run: nvm use $NODE_INSTALL_VERSION"
+      fi
+      ok "node $(node -v) installed"
+      NODE_WAS_INSTALLED=1
+    fi
   fi
 fi
 
@@ -559,6 +589,8 @@ fi
 # its own. So the route needs one 60-line loopback hop that rewrites that header.
 # It costs nothing when the key is absent — the provider is simply unusable until
 # a key is added, and the proxy sits idle.
+step "AgentRouter loopback proxy"
+
 AR_DIR="$DSH_HOME_DIR/agentrouter-proxy"
 run mkdir -p "$AR_DIR"
 run cp "$SRC_DIR/payload/agentrouter-proxy/agentrouter-proxy.mjs" "$AR_DIR/agentrouter-proxy.mjs"
@@ -714,6 +746,32 @@ exec "$INSTALLER_HOME/dsh-setup.sh" "\$@"
 SETUP
   chmod +x "$HOME/.local/bin/dsh-setup"
   ok "dsh-setup installed (reconfigure / repatch / qwen / doctor)"
+
+  # A fresh macOS does not have ~/.local/bin on PATH, so the shim above would be
+  # invisible ("zsh: command not found: dsh-setup"). Add it to whichever profile
+  # this login shell actually reads.
+  case "${SHELL:-}" in
+    */zsh) SHELL_PROFILE="$HOME/.zshrc" ;;
+    */bash) SHELL_PROFILE="$HOME/.bash_profile" ;;
+    *) SHELL_PROFILE="$HOME/.profile" ;;
+  esac
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ok "~/.local/bin already on PATH" ;;
+    *)
+      if [ -f "$SHELL_PROFILE" ] && grep -q 'HOME/.local/bin' "$SHELL_PROFILE" 2>/dev/null; then
+        info "~/.local/bin is in $(basename "$SHELL_PROFILE") — open a new terminal to pick it up"
+        PATH_WAS_CHANGED=1
+      else
+        {
+          echo ""
+          echo "# added by the dsh installer"
+          echo 'export PATH="$HOME/.local/bin:$PATH"'
+        } >> "$SHELL_PROFILE"
+        ok "added ~/.local/bin to $(basename "$SHELL_PROFILE")"
+        PATH_WAS_CHANGED=1
+      fi
+      ;;
+  esac
 fi
 
 if [ "$DRY_RUN" = 0 ]; then
@@ -778,6 +836,14 @@ fi
 if [ "$MISSING_COUNT" -gt 0 ]; then
   printf '\n%sBlank credentials%s — put them in a file and run: dsh-setup reconfigure --secrets <file>\n' "$C_DIM" "$C_RESET"
   printf '%s' "$MISSING_TEXT"
+fi
+
+if [ "$NODE_WAS_INSTALLED" = 1 ] || [ "$PATH_WAS_CHANGED" = 1 ]; then
+  printf '\n%sOpen a new terminal before anything else.%s\n' "$C_BOLD$C_YELLOW" "$C_RESET"
+  [ "$NODE_WAS_INSTALLED" = 1 ] && printf '  node was just installed by nvm, which only affects new shells\n'
+  [ "$PATH_WAS_CHANGED" = 1 ] && printf '  ~/.local/bin was added to your PATH (that is where dsh-setup lives)\n'
+  printf '  In THIS shell you can instead run:\n'
+  printf '    %sexport PATH="$HOME/.local/bin:$PATH"; . "$HOME/.nvm/nvm.sh"%s\n' "$C_BOLD" "$C_RESET"
 fi
 
 printf '\n%sNext:%s sign into the Qwen desktop app once — the bridge borrows that session —\n' "$C_BOLD" "$C_RESET"

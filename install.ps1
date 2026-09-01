@@ -62,11 +62,13 @@ $script:StepNo   = 0
 $script:Warnings = New-Object System.Collections.Generic.List[string]
 $script:Missing  = New-Object System.Collections.Generic.List[string]
 $script:Failed   = 0
+$script:NodeWasInstalled = $false
+$script:PathWasChanged  = $false
 
 function Write-Step($text) {
   $script:StepNo++
   Write-Host ''
-  Write-Host ("[{0}/9] {1}" -f $script:StepNo, $text) -ForegroundColor Blue
+  Write-Host ("[{0}/10] {1}" -f $script:StepNo, $text) -ForegroundColor Blue
 }
 function Write-Info($text) { Write-Host ("      {0}" -f $text) }
 function Write-Ok($text)   { Write-Host '      ' -NoNewline; Write-Host '+' -ForegroundColor Green -NoNewline; Write-Host " $text" }
@@ -126,6 +128,19 @@ Write-Host 'DeepSeek Harness - one-click setup' -ForegroundColor Blue
 Write-Host ("  payload: {0}" -f $SrcDir) -ForegroundColor DarkGray
 Write-Host ("  target:  {0}" -f $DshHome) -ForegroundColor DarkGray
 if ($DryRun) { Write-Host '  DRY RUN - nothing will be written' -ForegroundColor Yellow }
+
+# Fail on a missing secrets file NOW, not after node and dsh are already installed.
+if ($Secrets -and -not (Test-Path -LiteralPath $Secrets)) {
+  Write-Host ''
+  Write-Host "error: secrets file not found: $Secrets" -ForegroundColor Red
+  Write-Host ''
+  Write-Host 'Copy it over from the machine you generated it on, then re-run.'
+  Write-Host 'Or install without it and add the keys later:'
+  Write-Host '  <this same command, minus -Secrets>'
+  Write-Host '  dsh-setup reconfigure --secrets $HOME\dsh-secrets.env'
+  Write-Host ''
+  exit 2
+}
 
 # ── existing installation guard ──────────────────────────────────────────────
 
@@ -219,7 +234,13 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
       }
     }
     if (-not $installed) { Die 'node still not on PATH - open a new PowerShell and re-run' }
+    # Check, do not hope: an older node left active makes corepack, pnpm and dsh
+    # all fail later in confusing ways.
+    if ((Get-NodeMajor) -lt $NodeMajorMin) {
+      Die ("node {0} is active but {1}+ is required - open a new PowerShell and re-run" -f (& node -v), $NodeMajorMin)
+    }
     Write-Ok ("node {0} installed" -f (& node -v))
+    $script:NodeWasInstalled = $true
   }
 }
 
@@ -534,6 +555,8 @@ if ($SkipPatch) {
 # AgentRouter is a plain HTTPS API, but it 401s unless the request carries a
 # Claude-CLI User-Agent, and pi-ai overwrites a provider `headers:` User-Agent with
 # its own. So the route needs one 60-line loopback hop that rewrites that header.
+Write-Step 'AgentRouter loopback proxy'
+
 $ArDir = Join-Path $DshHome 'agentrouter-proxy'
 Invoke-Step { New-Item -ItemType Directory -Force -Path $ArDir | Out-Null } "mkdir $ArDir"
 Invoke-Step {
@@ -652,6 +675,7 @@ if (-not $DryRun -and ($SrcDir -ne $InstallerHome)) {
   if ($userPath -notlike "*$LocalBin*") {
     [Environment]::SetEnvironmentVariable('Path', "$userPath;$LocalBin", 'User')
     Write-Info "added $LocalBin to your PATH (new shells only)"
+    $script:PathWasChanged = $true
   }
   Write-Ok 'dsh-setup installed (reconfigure / repatch / qwen / doctor)'
 }
@@ -717,6 +741,13 @@ if ($script:Missing.Count -gt 0) {
   Write-Host ''
   Write-Host 'Blank credentials - put them in a file and run: dsh-setup reconfigure --secrets <file>' -ForegroundColor DarkGray
   foreach ($m in $script:Missing) { Write-Host "  $m" }
+}
+
+if ($script:NodeWasInstalled -or $script:PathWasChanged) {
+  Write-Host ''
+  Write-Host 'Open a new PowerShell before anything else.' -ForegroundColor Yellow
+  if ($script:NodeWasInstalled) { Write-Host '  node was just installed and only new shells see it' }
+  if ($script:PathWasChanged)   { Write-Host "  $LocalBin was added to your PATH (that is where dsh-setup lives)" }
 }
 
 Write-Host ''
