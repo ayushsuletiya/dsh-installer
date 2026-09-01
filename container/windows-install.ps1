@@ -116,6 +116,29 @@
   # ── 4. run ─────────────────────────────────────────────────────────────────
   Say ''
   Say '[4/5] Start'
+
+  # The earlier native install ran its own `dsh web` from a logon task, which
+  # would hold port 3080 and make the container fail to bind. Its Qwen bridge and
+  # AgentRouter proxy tasks are deliberately left alone: the container reaches
+  # both through host.docker.internal, so they are still doing useful work.
+  try {
+    $stale = Get-ScheduledTask -TaskName 'DSH Web' -ErrorAction Stop
+    if ($stale) {
+      Stop-ScheduledTask -TaskName 'DSH Web' -ErrorAction SilentlyContinue
+      Unregister-ScheduledTask -TaskName 'DSH Web' -Confirm:$false -ErrorAction SilentlyContinue
+      Warn 'retired the old native web task - the container serves 3080 now'
+    }
+  } catch { }
+  try {
+    foreach ($conn in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop)) {
+      $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+      if ($owner -and $owner.ProcessName -eq 'node') {
+        Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+        Warn ("stopped a leftover node process holding port " + $port)
+      }
+    }
+  } catch { }
+
   Docker @('rm', '-f', $name) -Quiet | Out-Null
   $runArgs = @(
     'run', '-d',
