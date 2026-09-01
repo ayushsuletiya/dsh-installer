@@ -1,0 +1,237 @@
+# DSH web-profile patch layer — rendered by the one-click installer.
+#
+# A top-level YAML array of loader patch entries (id-targeted config overrides,
+# disables and insert lists; `!!js` expressions allowed). Every absolute path in
+# here is substituted at install time, so this file is identical on macOS and
+# Windows apart from those paths.
+#
+# Re-render with:  dsh-setup reconfigure
+
+# ── compaction resilience ───────────────────────────────────────────────────
+# Compaction summarization is ONE direct `ctx.llm.stream()` call and
+# `dsh-llm-retry` only covers the agent loop's `agent/request-error` waterfall,
+# so a single provider hiccup surfaces as "Compaction could not produce a useful
+# summary" and `/compact` gives up with the conversation unchanged. This row
+# retries that one call on the same route, then makes a final attempt on a route
+# known to handle a full-size (300k+ token) summarization request.
+- insert:
+    - id: compaction-llm-retry
+      name: '{{PROFILE_WEB}}/compaction-llm-retry.mjs'
+      config:
+        retries: 3
+        initialDelayMs: 1500
+        maxDelayMs: 20000
+        fallback:
+          provider: tabitoken
+          model: claude-opus-4-8
+        logFile: !!js dshHomePath('logs', 'compaction-llm-retry.log')
+
+# ── keyless web search ──────────────────────────────────────────────────────
+# The shipped `web-search-deepseek` provider needs a DEEPSEEK_API_KEY, so every
+# `web_search` fails with WEB_PROVIDER_CREDENTIAL_MISSING on a fresh machine.
+# `web-search-ddg.mjs` registers `ddg-local`: DuckDuckGo via plain fetch, a gated
+# Bing fetch, then stealth headless-Chrome DDG as browser insurance — each layer's
+# output must pass a relevance gate before acceptance. Flip `searchProvider` back
+# to `deepseek-official` if a DeepSeek key is ever stored in credentials.
+- id: web
+  config:
+    searchProvider: ddg-local
+- insert:
+    - id: ddg-local
+      name: '{{PROFILE_WEB}}/web-search-ddg.mjs'
+      config:
+        timeoutMs: 20000
+        browserTimeoutMs: 45000
+        logFile: !!js dshHomePath('logs', 'web-search-ddg.log')
+
+#if META_ADS_BRIDGE_TOKEN
+# ── Meta Ads MCP (three rows off one bridge) ────────────────────────────────
+# Bridge: docker container meta-ads-mcp-bridge behind Traefik/TLS. It owns the
+# Facebook Login for Business PKCE flow, stores tokens chmod-600, refreshes
+# proactively and proxies to Meta with the Bearer injected per request.
+#   /mcp        hosted Ads MCP           -> mcp__meta_ads__*
+#   /mcp-read   read-only Marketing API  -> mcp__meta_ads_read__*
+#   /mcp-write  full management          -> mcp__meta_ads_write__*
+# Read-only is structural (its only egress helper is GET-with-allowlist), which
+# covers ad accounts Meta's hosted MCP still gates. Write safety lives in the
+# bridge: new entities default to PAUSED, oversized daily budgets are refused,
+# ARCHIVED/DELETED needs confirm:true, every write is appended to audit.log.
+- insert:
+    - id: mcp-meta-ads
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: meta_ads
+        transport: streamable-http
+        headers:
+          Authorization: 'Bearer {{META_ADS_BRIDGE_TOKEN}}'
+        url: '{{META_ADS_BRIDGE_URL}}/mcp'
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+
+- insert:
+    - id: mcp-meta-ads-read
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: meta_ads_read
+        transport: streamable-http
+        headers:
+          Authorization: 'Bearer {{META_ADS_BRIDGE_TOKEN}}'
+        url: '{{META_ADS_BRIDGE_URL}}/mcp-read'
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+
+- insert:
+    - id: mcp-meta-ads-write
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: meta_ads_write
+        transport: streamable-http
+        headers:
+          Authorization: 'Bearer {{META_ADS_BRIDGE_TOKEN}}'
+        url: '{{META_ADS_BRIDGE_URL}}/mcp-write'
+        toolCallTimeoutMs: 180000
+        failOnStartupError: false
+#endif
+
+# ── UI Skills design catalog (keyless public MCP) ───────────────────────────
+# Tools: mcp__ui_skills__list_skills / get_skill — design-engineering skills
+# (frontend-design, improve-ui, improve-animations) pulled as guidance before
+# building or auditing an interface.
+- insert:
+    - id: mcp-ui-skills
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ui_skills
+        transport: streamable-http
+        url: https://www.ui-skills.com/mcp
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+
+#if MULTILOGIN_DIR
+# ── Multilogin X antidetect-browser bridge ──────────────────────────────────
+# Local, dependency-free stdio MCP server; tools land as mcp__multilogin__*.
+# Two planes: cloud api.multilogin.com (auth + profile search) and the desktop
+# app's own agent on https://launcher.mlx.yt:45001 (resolves to 127.0.0.1), so
+# launcher tools only work while the Multilogin app is running — `open_app`
+# starts it and waits. Credentials live in ~/.multilogin-mcp/config.json (0600);
+# `node <dir>/mlx.mjs login` writes them without a token passing through a chat
+# transcript. The row disables itself when the server file is absent.
+- insert:
+    - id: mcp-multilogin
+      name: '@deepseek-ai/dsh-mcp-client'
+      # `=== false` rather than a leading `!`: YAML reads `!!js !expr` as a second
+      # tag property and dies with "duplication of a tag property".
+      disabled: !!js process.getBuiltinModule('node:fs').existsSync({{MULTILOGIN_SERVER_JSON}}) === false
+      config:
+        serverName: multilogin
+        transport: stdio
+        command: !!js process.execPath
+        args:
+          - '{{MULTILOGIN_DIR}}/server.mjs'
+        env:
+          MLX_TOKEN: !!js 'process.env.MLX_TOKEN ?? ""'
+          # HMR reconnects this row only when its CONFIG changes, not when
+          # server.mjs changes — bump this stamp to respawn the child on new code.
+          MLX_CODE_REV: '2026-08-27T08:40'
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+#endif
+
+#if HOSTINGER_API_TOKEN
+# ── Hostinger email: mailbox provisioning ───────────────────────────────────
+# The `mail` slice of Hostinger's own MCP server (npm hostinger-api-mcp) — one
+# scoped binary, so 38 mail tools instead of all 121. mcp__hostinger_mail__*:
+# orders, mailboxes, aliases, forwarders, catch-alls, autoreplies, webhooks, and
+# mail_createAPITokenV1 which mints the Agentic Mail token the message-level
+# server below needs. Every id argument comes from mail_listOrdersV1 first — the
+# order is per email subscription, not per domain.
+# The token is read from the file at load time (a plain process.env passthrough
+# arrives EMPTY because DSH does not export ~/.dsh/.env, and an empty token makes
+# this binary start an interactive OAuth browser flow). The read is wrapped so a
+# missing file yields "" instead of throwing during profile load.
+- insert:
+    - id: mcp-hostinger-mail
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: hostinger_mail
+        transport: stdio
+        command: '{{HOSTINGER_MCP_BIN}}'
+        args: ['--stdio']
+        cwd: '{{HOSTINGER_DIR}}'
+        env:
+          HOSTINGER_API_TOKEN: !!js (()=>{try{return process.getBuiltinModule("node:fs").readFileSync({{HOSTINGER_ENV_JSON}},"utf8").match(/^\s*HOSTINGER_API_TOKEN\s*=\s*(.+)$/m)[1].trim()}catch{return ""}})()
+          DEBUG: 'false'
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+#endif
+
+#if HOSTINGER_MAIL_API_TOKEN
+# ── Hostinger email: message level ──────────────────────────────────────────
+# The official remote server at https://mcp.mail.hostinger.com/mcp — read,
+# search, send, move, flag and delete MESSAGES, list folders, manage webhooks.
+# Tools land as mcp__hostinger_mail_msg__*. Complement to the row above: that one
+# provisions mailboxes, this one is the mailbox contents.
+# Auth is an Agentic Mail token, a DIFFERENT family from the platform token (the
+# platform one gets 401 here). Minted headlessly with
+# mcp__hostinger_mail__mail_createAPITokenV1 and stored in the same 0600 file.
+- insert:
+    - id: mcp-hostinger-mail-messages
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: hostinger_mail_msg
+        transport: streamable-http
+        url: https://mcp.mail.hostinger.com/mcp
+        headers:
+          Authorization: !!js (()=>{try{return "Bearer "+process.getBuiltinModule("node:fs").readFileSync({{HOSTINGER_ENV_JSON}},"utf8").match(/^\s*HOSTINGER_MAIL_API_TOKEN\s*=\s*(.+)$/m)[1].trim()}catch{return ""}})()
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+#endif
+
+# ── one provider heading per provider in the model picker ───────────────────
+# Modlens mirrors every text-only model as a second "<provider> (modlens vision)"
+# entry, which split NVIDIA NIM into two groups in the picker. Ayush wants one
+# category per provider, so the mirror is switched off by emptying the family
+# list. Pasting an image still works: the file path lands in the composer and
+# `modlens_read_image` reads it through the configured engine.
+- id: modlens
+  config:
+    families: []
+
+# Vision Toolkit, pointed at Ayush's own NIM key rather than the shared free
+# endpoint (which answers 429). `imageInputVariants` is OFF deliberately: with
+# hidden:true each variant provider reports the SAME display name as its upstream,
+# so the server returned two "NVIDIA NIM" groups, two "Qwen · Desktop App" and so
+# on, and choosing a twin sent provider id `vision-toolkit-<x>`, which left the
+# selector stuck in "selecting" with every entry disabled. One provider, one
+# group. Screenshots still work through the vision tools.
+- id: vision-toolkit
+  config:
+    provider:
+      baseUrl: https://integrate.api.nvidia.com/v1
+      credential: NVIDIA_NIM_API_KEY
+      model: moonshotai/kimi-k3
+      protocol: openai
+    imageInputVariants:
+      enabled: false
+
+# ── last-resort route change on a shut door ─────────────────────────────────
+# NVIDIA's free NIM tier answers 429 RATE_LIMIT (no body) when a big model's
+# shared capacity is busy. Same-route retries cannot help when the door is shut,
+# so this adds the missing last step: if a turn fails BEFORE emitting anything,
+# finish it on the next route instead of failing. Scoped to nvidia-nim so no
+# other provider's behaviour changes.
+- insert:
+    - id: llm-turn-fallback
+      name: '{{PROFILE_WEB}}/llm-turn-fallback.mjs'
+      config:
+        onlyProviders:
+          - nvidia-nim
+        retryableCodes: [ RATE_LIMIT, SERVER, TRANSPORT, TIMEOUT, EMPTY_RESPONSE ]
+        routes:
+          - provider: nvidia-nim
+            model: nvidia/nemotron-3-super-120b-a12b
+          - provider: nvidia-nim
+            model: nvidia/nemotron-3-ultra-550b-a55b
+          - provider: omni-free
+            model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+        logFile: !!js dshHomePath('logs', 'llm-turn-fallback.log')

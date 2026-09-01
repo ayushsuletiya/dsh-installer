@@ -1,0 +1,302 @@
+# The `opus-qwen` agent preset: a two-model system.
+#
+#   main agent (the session model — Opus 5 Thinking by default)
+#     owns the thinking: investigating the repository, deciding the design,
+#     applying every edit, running the build and tests, verifying the result.
+#
+#   Qwen3.8 Max (free desktop-app route, 1M context)
+#     owns the typing: `qwen_code` writes the code from a complete spec plus the
+#     file contents the main agent hands it, `qwen_image` generates images, and
+#     `subagent_qwen` lets Qwen work the files itself when that is genuinely
+#     wanted. Qwen never verifies its own work.
+#
+# The model route is NOT set here. The session model comes from the host plane
+# (`agent-default-model` in settings.yaml, currently claude-opus-5-thinking), so
+# this preset stays correct if the main model is switched. Qwen's route is set
+# per row below and resolves to the `qwen` provider in settings.yaml (the local
+# bridge at 127.0.0.1:3083), with `qwen-omni` (the OmniRoute relay) as fallback.
+#
+# This file is an AGENT-PLANE composition, copied from the shipped `standard`
+# preset. A service row here MUST sit inside a group carrying an `isolate`
+# realm; without one it publishes into the process-global root realm and
+# `dsh-agent-presets` rejects the mount. `true` means a realm private to this
+# standing mount. Rows that only CONSUME a host service (both shell tools,
+# `tool-jobs`, `tool-goal`, the delegation tools) must stay OUT of any realm, or
+# they resolve a realm the host never populated and contribute nothing.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are the main agent of a two-model system, powered by the {{model}} model, working in {{cwd}}.
+      You own the judgement: reading the code, choosing the approach, applying every change, and
+      proving it works. Qwen3.8 Max is your code writer, reached through `qwen_code` — a frontier
+      model on a free 1M-context quota that writes implementations, patches, and reviews from the
+      spec and file contents you give it. `qwen_image` generates images. `subagent_qwen` hands Qwen
+      the files directly, at one quota prompt per tool round trip, for the rare task that needs it.
+      Nothing about this delegation lowers your own bar: you review what comes back, you run the
+      build and the tests, and the answer is yours.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── the Qwen code writer ────────────────────────────────────────────────────
+
+# `qwen_code` + `qwen_image` and the delegation policy section. One call is one
+# free web-quota prompt: the plugin reads the caller-named files itself and
+# returns code, so a whole implementation costs one prompt instead of the
+# per-round-trip cost an agent loop on Qwen would pay.
+#
+# The plugin file lives under $DSH_HOME (it survives a `dsh` upgrade) and is
+# referenced absolutely rather than from this directory, because a bare
+# `@deepseek-ai/*` import only resolves from inside the profiles tree. Both this
+# preset and that file are tracked by `tooling/dsh-config`.
+#
+# It registers into the host `tools` and `systemPrompt` registries and publishes
+# no service, so it takes no realm. `fs`, `sandboxPolicy`, and `attachments` are
+# read optionally: file context, `write_to`, and inline image results degrade
+# with a stated reason rather than failing when one is absent.
+- id: qwen-coder
+  name: {{PROFILE_WEB}}/qwen-coder.mjs
+  config:
+    provider: qwen
+    model: qwen3.8-max
+    # When the Mac app is asleep or the bridge is down, the same account is
+    # reachable through OmniRoute; the model id there is `qwen/<model>`.
+    fallbackProvider: qwen-omni
+    fallbackModelPrefix: 'qwen/'
+    effort: high
+    maxTokens: 32768
+    timeoutMs: 600000
+    # Image generation is bridge-only (`POST /v1/images/generations`); the
+    # OmniRoute relay serves chat completions only.
+    imageEnabled: true
+    imageBaseURL: http://127.0.0.1:3083/v1
+    imageModel: qwen3.7-plus
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+# `shell-env` stays in the HOST composition, and both tools consume the host
+# registry from here; their executors are host-plane too.
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+              You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+              Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery. Planning is your own work: do not send it to another model.
+
+              The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+              Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner
+# must share this realm. `tokenMeter` deliberately stays host-plane.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    # `/clear`: the same manual-compaction bracket as `/compact`, answered with a
+    # short marker instead of a provider call, so clearing the model's view costs
+    # no tokens and cannot fail on a flaky endpoint.
+    - id: command-clear
+      name: {{PROFILE_WEB}}/command-clear.mjs
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+# The `subagents` registry and its spawn/fork backends live in the HOST
+# composition (a process singleton the api-proxy queries across sessions); this
+# preset contributes only the delegation TOOLS, which resolve that registry.
+# `workflows` is different — nothing outside an agent reads it — so every row
+# reaching it shares one entry-local realm here.
+#
+# ADDING ANOTHER MODEL-PINNED SPECIALIST: copy the `tool-subagent-qwen` row,
+# give it a unique `id` and `toolName`, and change `agentOptions` to that
+# model's provider/model pair from settings.yaml plus its own `persona` and
+# `toolFilter`. `provider: spawn` stays the same — it is the in-process
+# transport, not the LLM route, and it is what makes `agentOptions` an override
+# of the parent's model. Nothing else in this file needs to change.
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    # General-purpose child on the parent's own model.
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+    # Qwen3.8 Max as a full agent with its own file tools, for the task that
+    # genuinely needs Qwen to iterate over the repository itself. Every tool
+    # round trip spends one free-quota prompt, so `qwen_code` remains the
+    # default route for writing code; this is the deliberate, costlier one.
+    #
+    # `agentOptions` overrides only the child's LLM route (the in-process
+    # provider treats explicit values as overrides of inherited parent
+    # options). `persona` and `toolFilter` need the spawn provider's `persona`
+    # and `toolFilter` capabilities, which it declares. The allow-list keeps
+    # the child on file work: no delegation of its own, no web, and no
+    # `qwen_code` (it already IS Qwen).
+    - id: tool-subagent-qwen
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent_qwen
+        backgroundMode: continuable
+        agentOptions:
+          provider: qwen
+          model: qwen3.8-max
+        persona: >-
+          You are Qwen3.8 Max working as the implementation engineer inside another agent's
+          project. Write and change code in the repository yourself, matching the conventions,
+          language version, and libraries already present. Read before you edit; never leave a
+          placeholder, an elided region, or an invented API. Every tool call you make spends a
+          scarce quota prompt, so plan the whole change first and then execute it in as few
+          calls as possible. Report what you changed, what you verified, and what you did not.
+        toolFilter:
+          allow:
+            - read
+            - write
+            - edit
+            - glob
+            - grep
+            - bash
+            - todo_write
+
+    # Production dsh does not install these optional providers. Install the
+    # matching Bundle in this Profile and restart the Host, then remove
+    # `disabled` from the matching row. Host availability alone grants no tool.
+    - id: tool-subagent-codex
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: codex
+        toolName: subagent_codex
+        backgroundMode: one-shot
+        maxDepth: provider-managed
+
+    - id: tool-subagent-claude-code
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: claude-code
+        toolName: subagent_claude_code
+        backgroundMode: one-shot
+        maxDepth: provider-managed
+
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000

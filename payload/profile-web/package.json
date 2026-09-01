@@ -1,0 +1,39 @@
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "@anionex/dsh-vision-toolkit": "0.1.39",
+    "@changfenhuang/dsh-genui": "0.9.2",
+    "@deepseek-ai/dsh-mcp-client": "0.0.1-rc.1",
+    "@linxin666/dsh-web-all": "0.3.3",
+    "@liustack/modlens": "3.24.2",
+    "dsh-at-file": "github:FSMargoo/dsh-at-file#v0.6.8",
+    "dsh-find-plugin": "0.3.7",
+    "dsh-mnemon": "0.3.0",
+    "dshmarket": "1.29.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@linxin666/dsh-web-all",
+        "@liustack/modlens",
+        "@anionex/dsh-vision-toolkit",
+        "dsh-at-file",
+        "dshmarket",
+        "dsh-find-plugin",
+        "@changfenhuang/dsh-genui",
+        "dsh-mnemon"
+      ]
+    }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "cloudflared",
+      "cpu-features",
+      "node-pty",
+      "ssh2"
+    ]
+  }
+}

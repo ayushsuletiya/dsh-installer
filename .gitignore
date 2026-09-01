@@ -1,0 +1,10 @@
+# secrets — never commit
+*.env
+!secrets.example.env
+.credentials.yaml
+*.bak.*
+*.orig
+
+# local scratch
+node_modules/
+.DS_Store

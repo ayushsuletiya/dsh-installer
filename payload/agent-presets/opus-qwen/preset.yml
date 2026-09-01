@@ -1,0 +1,2 @@
+name: Opus + Qwen
+description: Opus 5 Thinking as the main agent with Qwen3.8 Max as its code writer — Opus investigates, decides, applies and verifies; `qwen_code` writes the code, `qwen_image` generates images, and `subagent_qwen` is there for when Qwen should drive the files itself.

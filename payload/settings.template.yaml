@@ -1,0 +1,785 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+llm-pi-ai:
+  providers:
+    tabitoken:
+      displayName: TabiToken · Claude Opus
+      apiKeyEnv: TABITOKEN_API_KEY
+      api: anthropic-messages
+      baseURL: https://tabi.72-60-219-89.sslip.io
+      models:
+        - id: claude-opus-5-thinking
+          name: Claude Opus 5 Thinking
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          reasoningEfforts:
+            xhigh: xhigh
+            max: max
+          compat:
+            forceAdaptiveThinking: true
+            supportsTemperature: false
+        - id: claude-opus-5
+          name: Claude Opus 5
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          compat:
+            supportsTemperature: false
+        - id: claude-opus-4-8-thinking
+          name: Claude Opus 4.8 Thinking
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          reasoningEfforts:
+            xhigh: xhigh
+            max: max
+          compat:
+            forceAdaptiveThinking: true
+            supportsTemperature: false
+        - id: claude-opus-4-8
+          name: Claude Opus 4.8
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          compat:
+            supportsTemperature: false
+
+    antigravity:
+      displayName: Antigravity · via OmniRoute
+      apiKeyEnv: OMNIROUTER_API_KEY
+      api: openai-completions
+      baseURL: https://omni.theworldofmemories.in/v1
+      # REWIRED 31 Aug 2026 — pure API key, NATIVE tool calling.
+      #
+      # Ayush connected both Antigravity accounts inside OmniRoute
+      # (Providers -> Antigravity, "2 connections", both connected), so the
+      # gateway now talks straight to Google's Code Assist backend
+      # (daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent)
+      # on his PAID Antigravity subscription. One OMNIROUTER_API_KEY reaches it
+      # from any machine or client, exactly like the codex route.
+      #
+      # The old `agy` CLI bridge on 127.0.0.1:3085 (~/antigravity-bridge) was
+      # REMOVED 1 Sep 2026 — it could not emit tool_calls at
+      # all and billed ~17.3k input tokens per call for the CLI's own agent
+      # system prompt. Nothing in DSH points at that bridge any more.
+      #
+      # VERIFIED LIVE 31 Aug 2026 on every model below:
+      #   - real OpenAI tool_calls payload, finish_reason=tool_calls
+      #   - full round trip: assistant tool_calls -> role:tool -> final answer
+      #   - 1.5-5s to first response, no CLI startup penalty
+      #
+      # The gateway always answers as an SSE stream even when stream is false.
+      # DSH handles that; a raw curl must parse `data:` lines or it sees
+      # "Unexpected token 'd'".
+      #
+      # Image input WORKS (verified 1 Sep 2026 on OmniRoute 3.8.50); every model
+      # here except gpt-oss-120b-medium declares `input: [ text, image ]`.
+      # antigravity/gemini-3.1-flash-image
+      # (400)", so no model here declares image. antigravity/gemini-3.1-flash-image
+      # is image-GENERATION and is refused for chat, so it is not registered.
+      #
+      # Context, measured with a 173k-token probe: Gemini accepted a 108k
+      # prompt, Claude 162k, and gpt-oss-120b hard-refused above 131k — so
+      # gpt-oss cannot carry a full ~166k DSH turn. Prefer Gemini or Claude.
+      #
+      # The Gemini High/Medium/Low ids are the app's OWN distinct models, so
+      # each is listed separately. The two Claude entries instead take a real
+      # reasoning_effort parameter, verified accepted by the gateway.
+      # Image input: VERIFIED working 1 Sep 2026 on OmniRoute 3.8.50 — every model
+      # below read a test PNG correctly (left half red, right half blue). It was
+      # text-only under 3.8.49, which is why these said `input: [ text ]` and DSH
+      # refused attachments with "current model does not support images".
+      # gpt-oss-120b-medium is the one exception: it 502s on an image part.
+      models:
+        - id: antigravity/claude-opus-4-6-thinking
+          name: Claude Opus 4.6 Thinking
+          contextWindow: 200000
+          maxTokens: 32768
+          input: [ text, image ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+        - id: antigravity/claude-sonnet-4-6
+          name: Claude Sonnet 4.6
+          contextWindow: 200000
+          maxTokens: 32768
+          input: [ text, image ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+        - id: antigravity/gemini-3.1-pro-low
+          name: Gemini 3.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-pro-agent
+          name: Gemini Pro Agent
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        # Gemini 3.7 Flash — only became reachable after OmniRoute was upgraded
+        # to 3.8.50 on 31 Aug 2026. The 3.8.49 connector served a stale
+        # Antigravity catalogue and answered 404 model_not_found for these ids
+        # even though the accounts had the model all along.
+        - id: antigravity/gemini-3.7-flash-high
+          name: Gemini 3.7 Flash · High
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.7-flash-medium
+          name: Gemini 3.7 Flash · Medium
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.7-flash-low
+          name: Gemini 3.7 Flash · Low
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        # "tiered" lets Antigravity choose the effort per request.
+        - id: antigravity/gemini-3.7-flash-tiered
+          name: Gemini 3.7 Flash · Tiered
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.6-flash-high
+          name: Gemini 3.6 Flash · High
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.6-flash-medium
+          name: Gemini 3.6 Flash · Medium
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.6-flash-low
+          name: Gemini 3.6 Flash · Low
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3-flash-agent
+          name: Gemini 3 Flash Agent
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.5-flash-low
+          name: Gemini 3.5 Flash · Low
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.5-flash-extra-low
+          name: Gemini 3.5 Flash · Extra Low
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-3.1-flash-lite
+          name: Gemini 3.1 Flash Lite
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-2.5-flash-thinking
+          name: Gemini 2.5 Flash Thinking
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-2.5-flash
+          name: Gemini 2.5 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: antigravity/gemini-2.5-flash-lite
+          name: Gemini 2.5 Flash Lite
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        # 131k ceiling — too small for a full DSH turn, fine for short chats.
+        - id: antigravity/gpt-oss-120b-medium
+          name: GPT-OSS 120B
+          contextWindow: 131072
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+
+    qwen-omni:
+      displayName: Qwen · via OmniRoute (chat only · any machine)
+      # CHAT ONLY, and this applies to the OmniRoute route ONLY — the local
+      # desktop bridge below DOES do the full tool loop. OmniRoute's Qwen executor
+      # folds the tool list into the prompt, so the model answers "Tool bash does
+      # not exists" and asks the user to run commands by hand, and sending a tool
+      # RESULT back returns HTTP 502 (reproduced 3/3, 1 Sep 2026). DSH has no
+      # per-model "no tools" flag — PiAiModelProfile offers only
+      # id/name/contextWindow/maxTokens/input/reasoningEfforts/compat — so the
+      # group name is the only place this can be surfaced.
+      apiKeyEnv: OMNIROUTER_API_KEY
+      api: openai-completions
+      baseURL: https://omni.theworldofmemories.in/v1
+      # Same Qwen account, reached through the OmniRoute gateway instead of the
+      # local app: /opt/qwen-relay on the VPS holds the web session (cookie +
+      # bx-ua signature) and speaks OpenAI, registered in OmniRoute as the custom
+      # node `qwen` (provider node openai-compatible-chat-50e757e6…, connection
+      # e06a72f5…). Works from any machine and does not need the Mac app awake;
+      # the Mac pushes a fresh signature every 30 min via run.sh → push-creds.mjs.
+      # PREFIX MATTERS, and it changed: `qwen/qwen3.8-max` now resolves to
+      # OpenRouter's PAID catalog and dies with "[402] requires more credits"
+      # (verified 31 Aug 2026). The web session is only reachable through the
+      # provider-node id below. All six ids answered on it. Tool calling is
+      # prompt-emulated on this route, so keep it for chat and reasoning.
+      models:
+        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.8-max
+          name: Qwen3.8 Max · OmniRoute
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.7-plus
+          name: Qwen3.7 Plus · OmniRoute
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.7-max
+          name: Qwen3.7 Max · OmniRoute
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: openai-compatible-chat-50e757e6-7539-4492-bedd-55aabaf18caf/qwen3.5-omni-plus
+          name: Qwen3.5 Omni Plus · OmniRoute
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+
+    qwen:
+      displayName: Qwen · Desktop App (full tools · local bridge)
+      # pi-ai refuses a provider with no credential ("No API key for provider:
+      # qwen", PI_AI_ERROR) even for a local endpoint, so a dummy ref is needed;
+      # the bridge ignores the Authorization header entirely.
+      apiKeyEnv: QWEN_BRIDGE_KEY
+      api: openai-completions
+      baseURL: http://127.0.0.1:3083/v1
+      # Added 28 Aug 2026. Runs through the Qwen DESKTOP APP: ~/qwen-bridge/
+      # server-app.mjs drives the app's own chat.qwen.ai page over CDP
+      # (port 9222), so requests carry Ayush's logged-in session and Alibaba's
+      # per-request bx-ua signature is computed by their own SDK. No API key and
+      # no billing. The app must be running; the bridge relaunches it with the
+      # debugging flag when the port is dead.
+      # Route limits: text only (no image upload). TOOL CALLING IS NATIVE since
+      # 29 Aug 2026: the web backend's own function-calling protocol is used, so
+      # the bridge sends the tool list as feature_config.local_mcp, reads the
+      # model's `local_tool` phase (extra.local_mcp = [{tool_name, params}]) and
+      # hands DSH real tool_calls; results go back as a role:"function" turn.
+      # Nothing is parsed out of prose and the tool-repair model is not spent.
+      # Budget is the free Qwen Studio quota (~100 prompts/day) and every tool
+      # round trip spends one, so long agent loops burn it quickly. Model ids and
+      # context sizes come from the app's own /api/models.
+      models:
+        - id: qwen3.8-max
+          name: Qwen3.8 Max · Desktop App
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: qwen3.7-plus
+          name: Qwen3.7 Plus · Desktop App
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: qwen3.7-max
+          name: Qwen3.7 Max · Desktop App
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: qwen3.6-plus
+          name: Qwen3.6 Plus · Desktop App
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: qwen3.5-plus
+          name: Qwen3.5 Plus · Desktop App
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        - id: qwen3.5-omni-plus
+          name: Qwen3.5 Omni Plus · Desktop App
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+
+    openrouter:
+      displayName: OpenRouter · Free
+      apiKeyEnv: OPENROUTER_API_KEY
+      api: openai-completions
+      models:
+        - id: openrouter/free
+          name: OpenRouter Free Models Router
+          contextWindow: 200000
+          input: [ text, image ]
+        - id: stealth/ox-alpha
+          name: Ox Alpha
+          contextWindow: 1048576
+          input: [ text, image ]
+        - id: cohere/north-mini-code:free
+          name: North Mini Code
+          contextWindow: 256000
+        - id: dots-studio/dots-3-note-preview:free
+          name: Dots3 Note Preview
+          contextWindow: 512000
+          input: [ text, image ]
+        - id: google/gemma-4-26b-a4b-it:free
+          name: Gemma 4 26B A4B
+          contextWindow: 262144
+          input: [ text, image ]
+        - id: google/gemma-4-31b-it:free
+          name: Gemma 4 31B
+          contextWindow: 262144
+          input: [ text, image ]
+        - id: liquid/lfm-2.5-2.6b:free
+          name: LFM 2.5 2.6B
+          contextWindow: 65536
+        - id: minimax/minimax-m2.7:free
+          name: MiniMax M2.7
+          contextWindow: 196608
+        - id: minimax/minimax-m3:free
+          name: MiniMax M3
+          contextWindow: 1048576
+          input: [ text, image ]
+        - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+          name: Nemotron 3 Nano Omni
+          contextWindow: 256000
+          input: [ text, image ]
+        - id: nvidia/nemotron-3-super-120b-a12b:free
+          name: Nemotron 3 Super
+          contextWindow: 262144
+        - id: nvidia/nemotron-3-ultra-550b-a55b:free
+          name: Nemotron 3 Ultra
+          contextWindow: 1000000
+        - id: nvidia/nemotron-3.5-content-safety:free
+          name: Nemotron 3.5 Content Safety
+          contextWindow: 128000
+          input: [ text, image ]
+        - id: nvidia/nemotron-3.5-lightning:free
+          name: Nemotron 3.5 Lightning
+          contextWindow: 1000000
+        - id: poolside/laguna-s-2.1:free
+          name: Laguna S 2.1
+          contextWindow: 262144
+        - id: poolside/laguna-xs-2.1:free
+          name: Laguna XS 2.1
+          contextWindow: 262144
+        - id: thinkingmachines/inkling:free
+          name: Inkling
+          contextWindow: 1048576
+          input: [ text, image ]
+        - id: thinkingmachines/inkling-small:free
+          name: Inkling Small
+          contextWindow: 1048576
+          input: [ text, image ]
+        - id: z-ai/glm-5.2:free
+          name: GLM 5.2 Free
+          contextWindow: 256000
+
+    nvidia-nim:
+      displayName: NVIDIA NIM
+      apiKeyEnv: NVIDIA_NIM_API_KEY
+      api: openai-completions
+      baseURL: https://integrate.api.nvidia.com/v1
+      # NVIDIA's free tier answers 429 when a big model's shared capacity is
+      # busy — Kimi K3 did it on a full DSH turn. The default policy burns five
+      # retries in ~8s, which is far too fast for a rate limit (the account is
+      # capped at 40 requests/minute anyway), so the turn fails instead of
+      # waiting. Back off in seconds, not milliseconds.
+      retryPolicy:
+        mode: normal
+        maxRetries: 5
+        retryableCodes: [ RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, EMPTY_RESPONSE ]
+        backoff:
+          initialDelayMs: 4000
+          maxDelayMs: 45000
+          jitterRatio: 0.2
+      # Added 28 Aug 2026 from Ayush's own build.nvidia.com key. Real provider API
+      # with NATIVE function calling — every model below was verified live
+      # returning a proper tool_calls payload. Account limit 40 requests/minute,
+      # no per-day cap, no billing.
+      #
+      # CONTEXT FLOOR: one DSH turn is ~166k tokens (system prompt + memory files
+      # + skill catalogue + ~128 tool schemas). NVIDIA's server subtracts the
+      # prompt from the window itself and answers
+      #   400 "max_tokens must be at least 1, got -34788"
+      # when it does not fit — not a DSH bug. Every model here was therefore also
+      # sent a 170k-token prompt WITH tools attached; the ones marked `131k ctx`
+      # in their display name failed that test and can only be used for small
+      # prompts and subagents. Big-window models were pushed further: minimax-m3
+      # held 216,827 tokens and mistral-nemotron 216,675; nemotron-3-super and
+      # nemotron-3-nano swallowed 240k.
+      #
+      # Surveyed 27 more models on this key; NOT added because they are unusable:
+      #   404 not enabled for this account — the whole llama-3.1-nemotron family
+      #   (51b/70b/ultra-253b), nemotron-4-340b, nemotron-nano-3-30b,
+      #   mistral-large-2, codestral-22b, gemma-3-12b, jamba-1.5-large,
+      #   phi-3.5-moe, dbrx, yi-large, palmyra-creative, kimi-k2.6,
+      #   cosmos-reason2-8b, zamba2-7b
+      #   never answered in 50s — gemma-4-31b-it, deepseek-v4-flash-0731,
+      #   nemotron-3.5-lightning-30b-a3b, llama-3.2-90b-vision
+      #   answers but ignores tools — ising-calibration-1.5-31b
+      #   tool call fine, breaks on a big prompt — muse-glimmer-30b
+      #   endpoint saturated at test time (retry later) — poolside/laguna-xs-2.1
+      #
+      # TOOL-USE QUALITY (second pass, agent-style system prompt + tool_choice
+      # auto, which is what DSH actually sends): the nemotron family, kimi-k3 and
+      # deepseek-v4-pro call the tool on the first ask. mistral-nemotron REFUSES
+      # on auto ("I'm not able to access local files") and only complies when
+      # tool_choice is forced to required — hence the warning in its name; treat it
+      # as chat-grade. minimax-m3 obeys auto (638ms) but returned empty content
+      # under required. Latency on first call: mistral-nemotron 0.45s ·
+      # nemotron-3-super 1.1s · nemotron-3-nano 1.2s · minimax-m3 1.0s ·
+      # nano-omni 2.0s · gpt-oss-20b 1.2s · gpt-oss-120b 0.7s ·
+      # nemotron-3-ultra 27s · kimi-k3 48s · deepseek-v4-pro 94s.
+      models:
+        - id: nvidia/nemotron-3-super-120b-a12b
+          name: Nemotron 3 Super 120B
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: mistralai/mistral-nemotron
+          name: Mistral Nemotron · chat only
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: nvidia/nemotron-3-nano-30b-a3b
+          name: Nemotron 3 Nano 30B
+          contextWindow: 262144
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+        - id: minimaxai/minimax-m3
+          name: MiniMax M3
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+          name: Nemotron 3 Nano Omni 30B
+          contextWindow: 262144
+          maxTokens: 32768
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: nvidia/nemotron-3-ultra-550b-a55b
+          name: Nemotron 3 Ultra 550B
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: moonshotai/kimi-k3
+          # NVIDIA's own model card: Input Context Length 1,048,576 tokens.
+          # Verified on the hosted endpoint — held a 344,404-token prompt (62s).
+          name: Kimi K3
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text, image ]
+          reasoningEfforts: false
+        - id: deepseek-ai/deepseek-v4-pro-0813
+          name: DeepSeek V4 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openai/gpt-oss-120b
+          name: GPT-OSS 120B · 131k ctx
+          contextWindow: 131072
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+        - id: openai/gpt-oss-20b
+          name: GPT-OSS 20B · 131k ctx
+          contextWindow: 131072
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+
+    agentrouter:
+      displayName: Others · AgentRouter
+      apiKeyEnv: AGENTROUTER_API_KEY
+      api: anthropic-messages
+      baseURL: http://127.0.0.1:3081
+      # Custom provider names inherit NOTHING from pi-ai's builtin catalog, so
+      # every model must spell out contextWindow/maxTokens/reasoningEfforts or
+      # it silently falls back to 262144 ctx / 32768 out with no thinking level.
+      # Metadata below verified live against the bridge on 25 Aug 2026:
+      # 450k input tokens accepted on all four routes; max_tokens 384000 is
+      # rejected only by the Claude routes (128000 cap); the upstream is
+      # adaptive-thinking Opus, so thinking blocks come back even for
+      # thinking.type=disabled, and the valueless `"off":` level exists only to
+      # offer "no thinking" in the picker (the router accepts either shape).
+      models:
+        - id: claude-opus-5
+          name: Claude Opus 5
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          reasoningEfforts:
+            "off":
+            xhigh: xhigh
+            max: max
+          compat:
+            forceAdaptiveThinking: true
+            supportsTemperature: false
+        - id: claude-opus-4-8
+          name: Claude Opus 4.8
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          reasoningEfforts:
+            "off":
+            xhigh: xhigh
+            max: max
+          compat:
+            forceAdaptiveThinking: true
+            supportsTemperature: false
+        - id: gpt-5.6-sol
+          name: GPT 5.6 Sol
+          contextWindow: 1000000
+          maxTokens: 128000
+          input: [ text, image ]
+          # The bridge translates Anthropic requests to the Responses API but
+          # never surfaces reasoning blocks, so no thinking level is offered.
+          reasoningEfforts: false
+        - id: deepseek-v4-flash
+          name: DeepSeek V4 Flash
+          contextWindow: 1000000
+          maxTokens: 384000
+          input: [ text ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+        # Added 28 Aug 2026 after GET /v1/models showed a 5th upstream route.
+        # Verified live: max_tokens hard-capped at 131072 ("限制数值范围[1,131072]"),
+        # 400k-word input accepted, base64 image blocks accepted, temperature
+        # accepted, and thinking blocks come back even for thinking.type=disabled.
+        # Usage accounting is unreliable on this route (input_tokens reported as
+        # 2 and 18 for 150k/400k-word prompts), so the context meter under-counts.
+        - id: glm-5.3
+          name: GLM 5.3
+          contextWindow: 1000000
+          maxTokens: 131072
+          input: [ text, image ]
+          reasoningEfforts:
+            "off":
+            high: high
+            max: max
+          compat:
+            forceAdaptiveThinking: true
+
+    omni-free:
+      displayName: Others · Free real APIs via OmniRoute
+      apiKeyEnv: OMNIROUTER_API_KEY
+      api: openai-completions
+      baseURL: https://omni.theworldofmemories.in/v1
+      # Added 28 Aug 2026 for "true connection direct to llm": unlike the `qwen`
+      # / `qwen-omni` routes (browser session + prompt-emulated tool calls),
+      # every model below is a REAL provider API reached through the existing
+      # OmniRoute key — so NATIVE function calling, no Chromium, no signature to
+      # refresh, no per-day web cap. All eight were verified live returning a
+      # proper `tool_calls` payload (get_weather) with these latencies:
+      #   north-mini-code 1.5s · nemotron-3-super 2.1s · nemotron-3-ultra 3.0s
+      #   hy3 3.0s · gemma-4-31b 3.6s · openrouter/free 4.7s · laguna-s 5.2s
+      #   oc/nemotron-3-ultra 8.1s
+      # Free tiers are rate-limited upstream: a 429 "reset after Ns" or an
+      # occasional timeout is the provider throttling, not a broken route.
+      # Rejected in testing: z-ai/glm-5.2:free (429/timeout), inkling:free (403,
+      # agentic plans only), oc/mimo-v2.5-free + oc/north-mini-code-free
+      # (upstream 404/401). Qwen itself has no free real-API route — checked all
+      # 1199 gateway ids; a DashScope key is the only way to get Qwen natively.
+      models:
+        - id: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+          name: Nemotron 3 Ultra 550B · free API
+          contextWindow: 1000000
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+          name: Nemotron 3 Super 120B · free API
+          contextWindow: 262144
+          maxTokens: 65536
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openrouter/cohere/north-mini-code:free
+          name: Cohere North Mini Code · free API
+          contextWindow: 256000
+          maxTokens: 64000
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openrouter/google/gemma-4-31b-it:free
+          name: Gemma 4 31B IT · free API
+          contextWindow: 262144
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openrouter/poolside/laguna-s-2.1:free
+          name: Poolside Laguna S 2.1 · free API
+          contextWindow: 262144
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+        - id: openrouter/openrouter/free
+          name: OpenRouter Auto · free API
+          contextWindow: 200000
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+        - id: oc/hy3-free
+          name: Hunyuan 3 · free API
+          contextWindow: 200000
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+        - id: oc/nemotron-3-ultra-free
+          name: Nemotron 3 Ultra · free API (alt route)
+          contextWindow: 200000
+          maxTokens: 32768
+          input: [ text ]
+          reasoningEfforts: false
+
+    omni-openai-oauth:
+      displayName: Others · Omni Router (OpenAI OAuth)
+      apiKeyEnv: OMNIROUTER_API_KEY
+      api: openai-completions
+      baseURL: https://omni.theworldofmemories.in/v1
+      models:
+        - id: codex/gpt-5.6-sol
+          name: GPT 5.6 Sol · OAuth
+          input: [ text, image ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+        - id: codex/gpt-5.6-sol-ultra
+          name: GPT 5.6 Sol Ultra · OAuth
+          input: [ text, image ]
+        - id: codex/gpt-5.6-terra
+          name: GPT 5.6 Terra · OAuth
+          input: [ text, image ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+        - id: codex/gpt-5.6-terra-ultra
+          name: GPT 5.6 Terra Ultra · OAuth
+          input: [ text, image ]
+        - id: codex/gpt-5.6-luna
+          name: GPT 5.6 Luna · OAuth
+          input: [ text, image ]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+        - id: codex/gpt-5.5
+          name: GPT 5.5 · OAuth
+          input: [ text, image ]
+          reasoningEfforts:
+            off: none
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+        - id: codex/gpt-5.3-codex-spark
+          name: GPT 5.3 Codex Spark · OAuth
+
+    google:
+      displayName: Others · Google Gemini (direct key)
+      apiKeyEnv: GEMINI_API_KEY
+
+    zai:
+      displayName: Others · Z.ai / GLM
+      apiKeyEnv: ZAI_API_KEY
+
+agent-default-model:
+  # Was `modlens-nvidia-nim` / deepseek-v4-pro — a provider id that stopped
+  # existing the moment the modlens mirror was switched off, so the default model
+  # dangled and the composer showed "Select model" with nothing chosen. Point it
+  # at the real provider and the fastest capable model.
+  # Deliberately on the Qwen web route: Ayush is testing its tool calling. It is
+  # a chat-only route (tools are emulated in the prompt, so the agent reports
+  # "Tool bash does not exists" and a tool RESULT sent back returns 502), so new
+  # sessions will not do real tool work until this is pointed back at
+  # tabitoken/claude-opus-5-thinking or antigravity/gemini-3.7-flash-high.
+  provider: tabitoken
+  model: claude-opus-5-thinking
+agent-presets:
+  # Every NEW session starts on the Opus+Qwen preset (~/.dsh/.agent-presets/
+  # opus-qwen): the model above stays the main agent and gets qwen_code /
+  # qwen_image / subagent_qwen on top. Hot-reloaded — a new chat picks it up
+  # without a restart, and sessions already running keep the preset they were
+  # composed with. Same as Settings → "Set as default"; revert with `standard`.
+  default: opus-qwen
+pet:
+  visible: false
+  size: 160
+  right: 24
+  bottom: 120
+  petId: whale-girl
+ui-theme:
+  preference: dark
