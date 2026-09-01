@@ -87,6 +87,13 @@ $script:Missing  = New-Object System.Collections.Generic.List[string]
 $script:Failed   = 0
 $script:NodeWasInstalled = $false
 $script:PathWasChanged  = $false
+# Absolute paths to the tools we drive. Resolved once node exists, and used
+# instead of bare names because PowerShell 5.1 would not see a mid-session PATH
+# addition on the machine this was fixed on.
+$script:NodeExe     = ''
+$script:NpmCmd      = ''
+$script:CorepackCmd = ''
+$script:GlobalBin   = ''
 # Managed install: the bootstrap from the distribution service sets these. The
 # machine is ours to configure, so config is fetched by token and applied without
 # asking, and an updater task is registered at the end.
@@ -223,9 +230,95 @@ if ($existing.Count -gt 0 -and -not $KeepConfig -and -not $ReplaceConfig -and -n
 
 Write-Step 'Node.js and pnpm'
 
+# Never resolve our own tools by name. On a real Windows 11 / PowerShell 5.1 box
+# the freshly unpacked node.exe ran fine by absolute path and was still invisible
+# to `Get-Command node` after $env:Path was updated in-process. Child processes
+# (pnpm, dsh) inherit the updated PATH and resolve normally through the OS, so
+# only what THIS script invokes needs absolute paths.
+function Resolve-NodeExe {
+  if ($script:NodeExe -and (Test-Path -LiteralPath $script:NodeExe)) { return $script:NodeExe }
+  $candidates = @()
+  $cmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { $candidates += $cmd.Source }
+  if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\dsh-node\node.exe') }
+  if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'nodejs\node.exe') }
+  $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+  if ($pf86) { $candidates += (Join-Path $pf86 'nodejs\node.exe') }
+  foreach ($p in ($env:Path -split ';')) {
+    if ($p) { $candidates += (Join-Path $p 'node.exe') }
+  }
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path -LiteralPath $c)) { $script:NodeExe = $c; return $script:NodeExe }
+  }
+  return ''
+}
+
 function Get-NodeMajor {
-  if (-not (Test-CommandExists 'node')) { return 0 }
-  try { return [int](& node -p 'process.versions.node.split(".")[0]' 2>$null) } catch { return 0 }
+  $exe = Resolve-NodeExe
+  if (-not $exe) { return 0 }
+  # `node -v` and a regex, NOT `node -p '...split(".")...'`: PowerShell 5.1 strips
+  # embedded double quotes when it hands arguments to a native command, so that
+  # expression reached node as broken JavaScript, node exited with a syntax error,
+  # and a perfectly good node looked like no node at all.
+  try {
+    $v = (& $exe -v 2>$null | Where-Object { $_ } | Select-Object -First 1)
+    if ("$v" -match '^v?(\d+)') { return [int]$matches[1] }
+    return 0
+  } catch { return 0 }
+}
+
+# Same quoting trap, general form: any JavaScript with a double quote in it has to
+# reach node as a FILE, never as -e / -p on the command line.
+function Invoke-NodeScript([string]$js, [string[]]$nodeArgs) {
+  $f = Join-Path $env:TEMP ("dsh-node-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".mjs")
+  Set-Content -LiteralPath $f -Value $js -Encoding ASCII
+  try {
+    if ($nodeArgs) { & $NodeBin $f @nodeArgs } else { & $NodeBin $f }
+  } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+}
+
+# npm, corepack and the global shim directory, all as absolute paths derived from
+# whichever node.exe we ended up with.
+function Set-NodeTooling {
+  $exe = Resolve-NodeExe
+  if (-not $exe) { return }
+  $dir = Split-Path -Parent $exe
+  $script:NpmCmd      = Join-Path $dir 'npm.cmd'
+  $script:CorepackCmd = Join-Path $dir 'corepack.cmd'
+  if (-not (Test-Path -LiteralPath $script:NpmCmd))      { $script:NpmCmd = '' }
+  if (-not (Test-Path -LiteralPath $script:CorepackCmd)) { $script:CorepackCmd = '' }
+  $script:GlobalBin = ''
+  if ($script:NpmCmd) {
+    try {
+      $p = (& $script:NpmCmd prefix -g 2>$null | Where-Object { $_ } | Select-Object -First 1)
+      if ($p) { $script:GlobalBin = "$p".Trim() }
+    } catch { }
+  }
+  if (-not $script:GlobalBin) { $script:GlobalBin = $dir }
+  # On Windows npm puts global shims straight into the prefix directory. It may
+  # not exist yet on a machine that has never installed a global package, and it
+  # has to be on PATH before dsh.cmd lands in it or new shells will not see dsh.
+  if (-not (Test-Path -LiteralPath $script:GlobalBin)) {
+    try { New-Item -ItemType Directory -Force -Path $script:GlobalBin | Out-Null } catch { }
+  }
+  if (Test-Path -LiteralPath $script:GlobalBin) { Add-UserPath $script:GlobalBin }
+}
+
+# A globally installed CLI, found as a file rather than trusted to PATH.
+function Get-ToolPath($name) {
+  $dirs = @()
+  if ($script:GlobalBin) { $dirs += $script:GlobalBin }
+  $exe = Resolve-NodeExe
+  if ($exe) { $dirs += (Split-Path -Parent $exe) }
+  foreach ($d in $dirs) {
+    foreach ($ext in @('.cmd', '.exe', '.bat')) {
+      $c = Join-Path $d ($name + $ext)
+      if (Test-Path -LiteralPath $c) { return $c }
+    }
+  }
+  $cmd = Get-Command $name -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { return $cmd.Source }
+  return ''
 }
 
 # A winget/MSI install lands in Program Files but does not reach THIS process's
@@ -234,6 +327,7 @@ function Update-SessionPath {
   $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
   $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
   $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+  $script:NodeExe = ''
 }
 
 # Persist a directory on the user's PATH and make it usable in this process too.
@@ -284,15 +378,17 @@ function Install-NodePortable {
   Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 
-  # Prove it runs before claiming success.
+  # Prove it runs before claiming success, then pin the absolute path: PATH
+  # resolution by name cannot be trusted for the rest of this run.
   $exe = Join-Path $dest 'node.exe'
   $reported = (& $exe -v 2>$null)
   if (-not $reported) { throw "node.exe unpacked but does not run" }
+  $script:NodeExe = $exe
   Add-UserPath $dest
 }
 
 if ((Get-NodeMajor) -ge $NodeMajorMin) {
-  Write-Ok ("node {0} already usable" -f (& node -v))
+  Write-Ok ("node {0} already usable" -f (& (Resolve-NodeExe) -v))
 } else {
   if ($DryRun) {
     Write-Info "would unpack node into $env:LOCALAPPDATA\Programs\dsh-node"
@@ -301,7 +397,7 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
     try {
       Install-NodePortable
       $installed = (Get-NodeMajor) -ge $NodeMajorMin
-      if (-not $installed) { Write-Warn 'unpacked node is not on PATH yet - trying the system installers' }
+      if (-not $installed) { Write-Warn 'the unpacked node does not report a usable version - trying the system installers' }
     } catch {
       Write-Warn "portable node install failed ($($_.Exception.Message)) - trying the system installers"
     }
@@ -335,25 +431,35 @@ if ((Get-NodeMajor) -ge $NodeMajorMin) {
       }
     }
     if (-not $installed) { Die "could not install Node.js. Install it from https://nodejs.org and re-run this command." }
-    # Check, do not hope: an older node left active makes corepack, pnpm and dsh
-    # all fail later in confusing ways.
-    if ((Get-NodeMajor) -lt $NodeMajorMin) {
-      Die ("node {0} is active but {1}+ is required - open a new PowerShell and re-run" -f (& node -v), $NodeMajorMin)
-    }
-    Write-Ok ("node {0} installed" -f (& node -v))
+    Write-Ok ("node {0} installed" -f (& (Resolve-NodeExe) -v))
+    Write-Info ("using {0}" -f (Resolve-NodeExe))
     $script:NodeWasInstalled = $true
   }
 }
 
-$NodeBin = if (Test-CommandExists 'node') { (Get-Command node).Source } else { 'node' }
+$NodeBin = Resolve-NodeExe
+if (-not $NodeBin) { $NodeBin = 'node' }
+Set-NodeTooling
 
-if (Test-CommandExists 'pnpm') {
-  Write-Ok ("pnpm {0}" -f (& pnpm -v))
+$PnpmCmd = Get-ToolPath 'pnpm'
+if ($PnpmCmd) {
+  Write-Ok ("pnpm {0}" -f (& $PnpmCmd -v))
 } elseif (-not $DryRun) {
-  Write-Info 'enabling pnpm via corepack'
-  try { & corepack enable pnpm 2>$null | Out-Null } catch {}
-  if (-not (Test-CommandExists 'pnpm')) { try { & npm install -g pnpm 2>$null | Out-Null } catch {} }
-  if (Test-CommandExists 'pnpm') { Write-Ok ("pnpm {0}" -f (& pnpm -v)) }
+  # npm first, corepack second. A corepack pnpm shim downloads the package
+  # manager on first use and asks for confirmation while doing it, which stalls
+  # `dsh plugin install`; a plain global pnpm has no such step. The prompt is
+  # disabled either way, because dsh may still reach a corepack shim.
+  $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
+  Write-Info 'installing pnpm'
+  if ($script:NpmCmd) {
+    try { & $script:NpmCmd install -g pnpm 2>$null | Out-Null } catch { }
+    $PnpmCmd = Get-ToolPath 'pnpm'
+  }
+  if (-not $PnpmCmd -and $script:CorepackCmd) {
+    try { & $script:CorepackCmd enable pnpm 2>$null | Out-Null } catch { }
+    $PnpmCmd = Get-ToolPath 'pnpm'
+  }
+  if ($PnpmCmd) { Write-Ok ("pnpm {0}" -f (& $PnpmCmd -v)) }
   else { Write-Warn 'pnpm unavailable - the plugin-bundle install will be skipped'; $SkipProfileInstall = $true }
 }
 
@@ -361,27 +467,29 @@ if (Test-CommandExists 'pnpm') {
 
 Write-Step "DeepSeek Harness $DshVersion"
 
+$DshCmd = Get-ToolPath 'dsh'
 $currentDsh = ''
-if (Test-CommandExists 'dsh') { try { $currentDsh = (& dsh --version 2>$null) } catch {} }
+if ($DshCmd) { try { $currentDsh = (& $DshCmd --version 2>$null) } catch { } }
 function Test-NewerVersion($have, $pin) {
   if (-not $have) { return $false }
-  # Same comparison as install.sh, done in node so both platforms agree.
-  & node -e '
-    const cmp = (a, b) => {
-      const norm = (v) => String(v).replace(/^v/, "").split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
-      const A = norm(a), B = norm(b);
-      for (let i = 0; i < Math.max(A.length, B.length); i++) {
-        const x = A[i], y = B[i];
-        if (x === y) continue;
-        if (x === undefined) return -1;
-        if (y === undefined) return 1;
-        if (typeof x === typeof y) return x > y ? 1 : -1;
-        return typeof x === "number" ? 1 : -1;
-      }
-      return 0;
-    };
-    process.exit(cmp(process.argv[1], process.argv[2]) > 0 ? 0 : 1);
-  ' $have $pin 2>$null
+  # Same comparison as install.sh, done in node so both platforms agree. Passed as
+  # a file because this JavaScript contains double quotes.
+  Invoke-NodeScript @'
+const cmp = (a, b) => {
+  const norm = (v) => String(v).replace(/^v/, "").split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
+  const A = norm(a), B = norm(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = A[i], y = B[i];
+    if (x === y) continue;
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (typeof x === typeof y) return x > y ? 1 : -1;
+    return typeof x === "number" ? 1 : -1;
+  }
+  return 0;
+};
+process.exit(cmp(process.argv[2], process.argv[3]) > 0 ? 0 : 1);
+'@ @($have, $pin) 2>$null | Out-Null
   return ($LASTEXITCODE -eq 0)
 }
 
@@ -392,13 +500,18 @@ if ($currentDsh -eq $DshVersion) {
 } else {
   Write-Info "npm install -g @deepseek-ai/dsh@$DshVersion"
   if (-not $DryRun) {
-    & npm install -g "@deepseek-ai/dsh@$DshVersion" 2>$null | Out-Null
+    if (-not $script:NpmCmd) { Die 'npm was not found next to node - cannot install dsh' }
+    & $script:NpmCmd install -g "@deepseek-ai/dsh@$DshVersion" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { Die "could not install @deepseek-ai/dsh@$DshVersion" }
-    Update-SessionPath
-    Write-Ok ("dsh {0}" -f (& dsh --version 2>$null))
+    $DshCmd = Get-ToolPath 'dsh'
+    if (-not $DshCmd) { Die "dsh installed but its shim was not found in $script:GlobalBin" }
+    Write-Ok ("dsh {0}" -f (& $DshCmd --version 2>$null))
   }
 }
-if (-not $DryRun) { $env:NPM_GLOBAL_ROOT = (& npm root -g 2>$null) }
+if (-not $DryRun -and $script:NpmCmd) {
+  $root = (& $script:NpmCmd root -g 2>$null | Where-Object { $_ } | Select-Object -First 1)
+  if ($root) { $env:NPM_GLOBAL_ROOT = "$root".Trim() }
+}
 
 # ── 3. credentials ──────────────────────────────────────────────────────────
 
@@ -525,7 +638,7 @@ $env:DSHX_TABITOKEN_BASE_URL = $Secret['TABITOKEN_BASE_URL']
 $env:DSHX_OMNIROUTE_BASE_URL = $Secret['OMNIROUTE_BASE_URL']
 $env:DSHX_QWEN_OMNI_NODE_ID  = $Secret['QWEN_OMNI_NODE_ID']
 if (-not $DryRun) {
-  & node (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\settings.template.yaml') $settingsPath | Out-Null
+  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\settings.template.yaml') $settingsPath | Out-Null
   if ($LASTEXITCODE -ne 0) { Die 'rendering settings.yaml failed' }
 }
 Protect-File $settingsPath
@@ -572,7 +685,8 @@ if ($KeepConfig) {
 if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'cordis.yml')) -and -not $DryRun) {
   Write-Info 'scaffolding the profile with dsh itself'
   $env:DSH_HOME = $DshHome
-  try { & dsh --profile web --dump-default-config 2>$null | Out-Null } catch {}
+  if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
+  if ($DshCmd) { try { & $DshCmd --profile web --dump-default-config 2>$null | Out-Null } catch { } }
 }
 
 Invoke-Step {
@@ -587,16 +701,16 @@ if (-not $DryRun) {
   if ($gitWorks) {
     Write-Ok 'git available - keeping the pinned dsh-at-file tag'
   } else {
-    & node -e '
-      const fs = require("node:fs");
-      const file = process.argv[1];
-      const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
-      let swapped = 0;
-      for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
-        if (typeof spec === "string" && /^(github:|git\+|git:)/.test(spec)) { pkg.dependencies[name] = "*"; swapped += 1; }
-      }
-      if (swapped) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
-    ' (Join-Path $ProfileDir 'package.json') 2>$null
+    Invoke-NodeScript @'
+import fs from "node:fs";
+const file = process.argv[2];
+const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+let swapped = 0;
+for (const [name, spec] of Object.entries(pkg.dependencies || {})) {
+  if (typeof spec === "string" && /^(github:|git\+|git:)/.test(spec)) { pkg.dependencies[name] = "*"; swapped += 1; }
+}
+if (swapped) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+'@ @((Join-Path $ProfileDir 'package.json')) 2>$null | Out-Null
     Write-Warn 'no working git - git-pinned bundles fall back to their npm release'
   }
 }
@@ -610,7 +724,7 @@ Write-Ok '5 local plugins + 10 bundle declarations'
 # Forward slashes throughout: Node accepts them on Windows, and they need no
 # escaping inside YAML strings or the `!!js` expressions.
 function ToFwd($p) { return ($p -replace '\\', '/') }
-function JsonStr($p) { return (& node -p 'JSON.stringify(process.argv[1])' $p) }
+function JsonStr($p) { return (& $NodeBin -p 'JSON.stringify(process.argv[1])' $p) }
 
 $env:DSHX_PROFILE_WEB = ToFwd $ProfileDir
 $env:DSHX_DSH_HOME    = ToFwd $DshHome
@@ -639,7 +753,7 @@ if (Test-Path -LiteralPath $mlServer) {
 $patchPath = Join-Path $ProfileDir 'cordis.patch.yml'
 if (-not $DryRun) {
   Backup-File $patchPath
-  & node (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\profile-web\cordis.patch.template.yml') $patchPath | Out-Null
+  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') (Join-Path $SrcDir 'payload\profile-web\cordis.patch.template.yml') $patchPath | Out-Null
   if ($LASTEXITCODE -ne 0) { Die 'rendering cordis.patch.yml failed' }
 }
 Write-Ok 'cordis.patch.yml rendered for this machine'
@@ -654,17 +768,19 @@ Write-Info 'UI Skills MCP: always on (keyless)'
 # package installed — so this is handled in one place for both platforms.
 $wsPath = Join-Path $ProfileDir 'pnpm-workspace.yaml'
 if (-not $DryRun -and (Test-Path -LiteralPath $wsPath)) {
-  & node (Join-Path $SrcDir 'tools\pnpm-allow-builds.mjs') $wsPath 2>$null | Out-Null
+  & $NodeBin (Join-Path $SrcDir 'tools\pnpm-allow-builds.mjs') $wsPath 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { Write-Warn 'could not write pnpm build approvals' }
 }
 
 if (-not $SkipProfileInstall -and -not $DryRun) {
   Write-Info 'installing the plugin bundles - the slow step, a few minutes on first run'
   $log = Join-Path $env:TEMP 'dsh-plugin-install.log'
+  if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
   Push-Location $ProfileDir
   try {
     $env:DSH_HOME = $DshHome
-    & dsh plugin --profile web install *> $log
+    # dsh shells out to pnpm, which the child finds through the inherited PATH.
+    & $DshCmd plugin --profile web install *> $log
     if ($LASTEXITCODE -eq 0) { Write-Ok 'plugin bundles installed' }
     else { Write-Warn "plugin install reported errors - see $log" }
   } finally { Pop-Location }
@@ -685,7 +801,7 @@ Invoke-Step {
   Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\preset.yml') -Destination (Join-Path $PresetDir 'preset.yml') -Force
 } 'copy preset.yml'
 if (-not $DryRun) {
-  & node (Join-Path $SrcDir 'tools\render.mjs') `
+  & $NodeBin (Join-Path $SrcDir 'tools\render.mjs') `
     (Join-Path $SrcDir 'payload\agent-presets\opus-qwen\agent.cordis.template.yml') `
     (Join-Path $PresetDir 'agent.cordis.yml') | Out-Null
   if ($LASTEXITCODE -ne 0) { Die 'rendering the agent preset failed' }
@@ -702,7 +818,7 @@ if ($SkipPatch) {
 } elseif ($DryRun) {
   Write-Info 'would patch @deepseek-ai/dsh-client-ui-model-selection'
 } else {
-  & node (Join-Path $SrcDir 'tools\patch-model-selector.mjs')
+  & $NodeBin (Join-Path $SrcDir 'tools\patch-model-selector.mjs')
   if ($LASTEXITCODE -eq 4) { Write-Warn 'model-picker patch skipped (the picker still works, without folding)' }
 }
 
@@ -761,7 +877,7 @@ if ($SkipQwen) {
   Write-Ok "bridge installed at $BridgeDir"
 
   if (-not $DryRun) {
-    & node (Join-Path $SrcDir 'tools\install-qwen-app.mjs')
+    & $NodeBin (Join-Path $SrcDir 'tools\install-qwen-app.mjs')
     if ($LASTEXITCODE -ne 0) {
       Write-Warn 'Qwen app not installed automatically - get it from https://qwen.ai/download'
     } else {
@@ -887,8 +1003,9 @@ if (-not $DryRun -and ($SrcDir -ne $InstallerHome)) {
 }
 
 if (-not $DryRun) {
+  if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
   try {
-    $v = (& dsh --version 2>$null)
+    $v = if ($DshCmd) { (& $DshCmd --version 2>$null) } else { '' }
     if ($v) { Write-Ok "dsh $v responds" } else { Write-Warn 'dsh --version failed'; $script:Failed = 1 }
   } catch { Write-Warn 'dsh --version failed'; $script:Failed = 1 }
 
@@ -902,10 +1019,10 @@ if (-not $DryRun) {
   if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'node_modules'))) {
     Write-Info 'composition check skipped - bundles not installed yet'
     Write-Info 'run: dsh plugin --profile web install'
-  } else {
+  } elseif ($DshCmd) {
     $dumpLog = Join-Path $env:TEMP 'dsh-dump-config.log'
     $env:DSH_HOME = $DshHome
-    & dsh --profile web --dump-config *> $dumpLog
+    & $DshCmd --profile web --dump-config *> $dumpLog
     if ($LASTEXITCODE -eq 0) {
       $rows = (Select-String -Path $dumpLog -Pattern '^- id:' -AllMatches).Count
       Write-Ok "composed web profile parses ($rows top-level rows)"
@@ -952,8 +1069,9 @@ if ($script:Missing.Count -gt 0 -and -not $Managed) {
 if ($script:NodeWasInstalled -or $script:PathWasChanged) {
   Write-Host ''
   Write-Host 'Open a new PowerShell before anything else.' -ForegroundColor Yellow
-  if ($script:NodeWasInstalled) { Write-Host '  node was just installed and only new shells see it' }
-  if ($script:PathWasChanged)   { Write-Host "  $LocalBin was added to your PATH (that is where dsh-setup lives)" }
+  if ($script:NodeWasInstalled) { Write-Host ("  node lives in {0}" -f (Split-Path -Parent $NodeBin)) }
+  if ($script:GlobalBin)        { Write-Host ("  dsh lives in {0}" -f $script:GlobalBin) }
+  if ($script:PathWasChanged)   { Write-Host '  both, and ~\.local\bin, were added to your PATH - only new shells see it' }
 }
 
 Write-Host ''
