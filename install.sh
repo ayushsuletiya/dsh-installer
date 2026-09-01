@@ -967,6 +967,19 @@ if [ "$DRY_RUN" = 0 ]; then
       warn "Qwen bridge not answering yet — sign into the Qwen app, then: tail -f $BRIDGE_DIR/bridge.log"
     fi
   fi
+
+  # Does the UI actually serve? A profile that composes and a `dsh` that answers
+  # --version both pass while the web server boots, dies on a plugin, and leaves
+  # the browser with a page and nothing else. This walks every plugin bundle the
+  # browser would fetch and then checks the server is still alive.
+  if [ -f "$SRC_DIR/tools/verify-web.mjs" ] && [ -d "$PROFILE_DIR/node_modules" ]; then
+    info "checking the web UI the way a browser does"
+    if DSH_HOME="$DSH_HOME_DIR" node "$SRC_DIR/tools/verify-web.mjs" --start dsh --timeout 90; then
+      ok "web UI verified — every plugin bundle serves"
+    else
+      warn "the web UI is not serving its plugins — see the lines above"; FAILED=1
+    fi
+  fi
 fi
 
 # ── report ──────────────────────────────────────────────────────────────────
