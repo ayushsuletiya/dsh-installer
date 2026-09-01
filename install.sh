@@ -33,6 +33,10 @@ NODE_INSTALL_VERSION="${NODE_INSTALL_VERSION:-24}"
 NODE_WAS_INSTALLED=0
 NVM_LOG="${TMPDIR:-/tmp}/dsh-nvm-install.log"
 PATH_WAS_CHANGED=0
+MANAGED=0
+DIST_BASE="${DSH_DIST_BASE:-}"
+DIST_TOKEN="${DSH_DIST_TOKEN:-}"
+DIST_VERSION="${DSH_DIST_VERSION:-}"
 NVM_VERSION="v0.40.1"
 REPO_URL="${DSH_INSTALLER_REPO:-https://github.com/ayushsuletiya/dsh-installer.git}"
 REPO_BRANCH="${DSH_INSTALLER_BRANCH:-main}"
@@ -65,13 +69,14 @@ else
 fi
 
 STEP_NO=0
+TOTAL_STEPS=10
 WARN_COUNT=0
 WARN_TEXT=""
 MISSING_TEXT=""
 MISSING_COUNT=0
 FAILED=0
 
-step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%d/10] %s%s\n' "$C_BOLD$C_BLUE" "$STEP_NO" "$*" "$C_RESET"; }
+step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%d/%d] %s%s\n' "$C_BOLD$C_BLUE" "$STEP_NO" "$TOTAL_STEPS" "$*" "$C_RESET"; }
 info() { printf '      %s\n' "$*"; }
 ok()   { printf '      %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() {
@@ -96,6 +101,10 @@ while [ $# -gt 0 ]; do
     --replace-config) REPLACE_CONFIG=1; shift ;;
     --keep-config) KEEP_CONFIG=1; shift ;;
     --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+    # Managed install: the bootstrap from the distribution service sets this. The
+    # machine is ours to configure, so config is fetched by token and applied
+    # without asking, and an updater agent is installed at the end.
+    --managed) MANAGED=1; REPLACE_CONFIG=1; TOTAL_STEPS=11; shift ;;
     --dsh-version) DSH_PKG_VERSION="${2:?}"; shift 2 ;;
     -h|--help) sed -n '2,26p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -135,6 +144,13 @@ fi
 printf '%s%sDeepSeek Harness — one-click setup%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
 printf '%s  payload: %s%s\n' "$C_DIM" "$SRC_DIR" "$C_RESET"
 printf '%s  target:  %s%s\n' "$C_DIM" "$DSH_HOME_DIR" "$C_RESET"
+# DSH_HOME wins over HOME by design, which means an inherited DSH_HOME from an
+# unrelated parent process can send the whole install somewhere unintended. Say so
+# loudly rather than quietly rewriting a config the user did not mean to touch.
+case "$DSH_HOME_DIR" in
+  "$HOME/.dsh") ;;
+  *) printf '%s  note:    DSH_HOME is set, so this is NOT %s/.dsh%s\n' "$C_YELLOW" "$HOME" "$C_RESET" ;;
+esac
 if [ "$DRY_RUN" = 1 ]; then
   printf '%s  DRY RUN — nothing will be written%s\n' "$C_YELLOW" "$C_RESET"
 fi
@@ -361,6 +377,40 @@ for k in $SECRET_KEYS $ENDPOINT_KEYS; do eval "SECRET_$k=\"\""; done
 if [ -f "$DSH_HOME_DIR/.env" ]; then
   read_secret_file "$DSH_HOME_DIR/.env"
   ok "carried existing values from ~/.dsh/.env"
+fi
+
+# Managed machines get their keys from the distribution service over TLS, keyed to
+# their enrollment token. Nothing is typed, and nothing is carried by hand.
+if [ "$MANAGED" = 1 ] && [ -n "$DIST_BASE" ] && [ -n "$DIST_TOKEN" ] && [ "$DRY_RUN" = 0 ]; then
+  CONFIG_JSON="${TMPDIR:-/tmp}/dsh-managed-config.$$.json"
+  if curl -fsSL --max-time 40 "$DIST_BASE/config/$DIST_TOKEN" -o "$CONFIG_JSON" 2>/dev/null; then
+    # node is already installed by step 1, so use it rather than parsing JSON in sh.
+    CONFIG_ENV="$(node -e '
+      const fs = require("node:fs");
+      const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const out = [];
+      for (const group of ["credentials", "endpoints"]) {
+        for (const [k, v] of Object.entries(d[group] ?? {})) {
+          if (!/^[A-Z0-9_]+$/.test(k) || v === null || v === undefined) continue;
+          out.push(`${k}=${String(v)}`);
+        }
+      }
+      process.stdout.write(out.join("\n"));
+    ' "$CONFIG_JSON" 2>/dev/null)"
+    if [ -n "$CONFIG_ENV" ]; then
+      MANAGED_TMP="${TMPDIR:-/tmp}/dsh-managed-env.$$"
+      printf '%s\n' "$CONFIG_ENV" > "$MANAGED_TMP"
+      read_secret_file "$MANAGED_TMP"
+      rm -f "$MANAGED_TMP"
+      ENROLL_NAME="$(node -e 'const d=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(d.enrollment?.name??"")' "$CONFIG_JSON" 2>/dev/null)"
+      ok "configuration fetched for this machine${ENROLL_NAME:+ ($ENROLL_NAME)}"
+    else
+      warn "the distribution service returned no usable configuration"
+    fi
+    rm -f "$CONFIG_JSON"
+  else
+    warn "could not fetch configuration from $DIST_BASE — installing without keys"
+  fi
 fi
 if [ -n "$SECRETS_FILE" ]; then
   [ -f "$SECRETS_FILE" ] || die "secrets file not found: $SECRETS_FILE"
@@ -723,6 +773,71 @@ PLI
   fi
 fi
 
+# ── managed updater ─────────────────────────────────────────────────────────
+
+if [ "$MANAGED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+  step "Managed updates"
+
+  UPD_DIR="$DSH_HOME_DIR/updater"
+  mkdir -p "$UPD_DIR" "$DSH_HOME_DIR/logs"
+  cp "$SRC_DIR/payload/updater/check-update.mjs" "$UPD_DIR/check-update.mjs"
+
+  # This file is what makes the machine "managed": where to check, as whom, and
+  # what it currently runs. The updater rewrites `version` after each upgrade.
+  cat > "$DSH_HOME_DIR/managed.json" <<MJ
+{
+  "base": "$DIST_BASE",
+  "token": "$DIST_TOKEN",
+  "version": "${DIST_VERSION:-0.0.0}",
+  "installed": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+MJ
+  chmod 600 "$DSH_HOME_DIR/managed.json"
+  ok "enrolled for updates from $DIST_BASE"
+
+  mkdir -p "$HOME/.local/bin"
+  cat > "$HOME/.local/bin/dsh-update" <<UPD
+#!/bin/sh
+# Check for a managed DeepSeek Harness update now.
+#   dsh-update           ask, then install if you say yes
+#   dsh-update --apply   install without asking
+exec "$NODE_BIN" "$UPD_DIR/check-update.mjs" "\$@"
+UPD
+  chmod +x "$HOME/.local/bin/dsh-update"
+
+  if [ "$PLATFORM" = mac ]; then
+    UPD_PLIST="$HOME/Library/LaunchAgents/com.dsh.updater.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$UPD_PLIST" <<UPLI
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.dsh.updater</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$NODE_BIN</string>
+    <string>$UPD_DIR/check-update.mjs</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>$DSH_HOME_DIR/logs/updater.log</string>
+  <key>StandardErrorPath</key><string>$DSH_HOME_DIR/logs/updater.log</string>
+</dict>
+</plist>
+UPLI
+    # Reload so an upgrade picks up a changed plist instead of keeping the old one.
+    launchctl unload "$UPD_PLIST" >/dev/null 2>&1 || true
+    if launchctl load -w "$UPD_PLIST" >/dev/null 2>&1; then
+      ok "update check every 6 hours — you get a prompt when a new version ships"
+    else
+      warn "launchctl refused the updater; run 'launchctl load -w $UPD_PLIST' from Terminal"
+    fi
+  else
+    info "add '$HOME/.local/bin/dsh-update' to cron to check automatically"
+  fi
+fi
+
 # ── 9. dsh-setup helper + verification ──────────────────────────────────────
 
 step "Verify"
@@ -833,7 +948,7 @@ if [ "$WARN_COUNT" -gt 0 ]; then
   printf '%s' "$WARN_TEXT"
 fi
 
-if [ "$MISSING_COUNT" -gt 0 ]; then
+if [ "$MISSING_COUNT" -gt 0 ] && [ "$MANAGED" = 0 ]; then
   printf '\n%sBlank credentials%s — put them in a file and run: dsh-setup reconfigure --secrets <file>\n' "$C_DIM" "$C_RESET"
   printf '%s' "$MISSING_TEXT"
 fi
