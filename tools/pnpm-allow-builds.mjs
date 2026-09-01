@@ -10,10 +10,18 @@
 // "set this to true or false" placeholders and exits non-zero
 // (ERR_PNPM_IGNORED_BUILDS) even though every package installed fine.
 //
-// So: write both keys, and repair the placeholder stub if pnpm already left one.
+// The answer is DECLINE, explicitly. These four bindings are optional extras and
+// three of them need a C toolchain that a factory-fresh Mac or Windows box does not
+// have — approving them makes `ssh2` run node-gyp, fail ("Failed to build optional
+// crypto binding"), and take the whole ten-bundle install down with ELIFECYCLE.
+// Declining is not the same as leaving the key out: an explicit `false` is the
+// acknowledgement pnpm 11 wants, so it stops erroring and the install exits clean.
+// A machine WITH a toolchain can flip these to true for the native fast paths.
 // Idempotent — running it twice changes nothing.
 import fs from "node:fs";
 
+// Optional native bindings. false = do not run their build scripts; every one of
+// them has a working pure-JS or download-on-demand fallback.
 const PACKAGES = ["cloudflared", "cpu-features", "node-pty", "ssh2"];
 const file = process.argv[2];
 if (!file) {
@@ -52,15 +60,18 @@ for (const key of ["allowBuilds", "onlyBuiltDependencies"]) text = stripBlock(te
 text = `${text.replace(/\n{3,}$/, "\n").replace(/\s+$/, "")}\n`;
 
 text += `
-# Native packages allowed to run their build scripts.
-# pnpm 11 reads allowBuilds; pnpm 10 reads onlyBuiltDependencies; the same list in
-# package.json's \`pnpm\` field is ignored by both. Without this pnpm exits non-zero
-# with ERR_PNPM_IGNORED_BUILDS even when every package installed.
+# Optional native bindings, explicitly DECLINED.
+# pnpm 11 reads allowBuilds and treats a missing decision as an error
+# (ERR_PNPM_IGNORED_BUILDS) even when every package installed. Three of these need a
+# C toolchain a fresh Mac or Windows box does not have, and ssh2 in particular fails
+# its optional crypto binding and takes the whole install down with it. Every one of
+# them has a working fallback, so declining costs nothing.
+# On a machine with a compiler, flip any of these to true for the native fast path.
 allowBuilds:
-${PACKAGES.map((p) => `  ${p}: true`).join("\n")}
+${PACKAGES.map((p) => `  ${p}: false`).join("\n")}
 
-onlyBuiltDependencies:
-${PACKAGES.map((p) => `  - ${p}`).join("\n")}
+# pnpm 10 read this key instead. Left empty for the same reason.
+onlyBuiltDependencies: []
 `;
 
 if (text !== before) {
