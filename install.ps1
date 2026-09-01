@@ -32,6 +32,7 @@ param(
   [switch]$ReplaceConfig,
   [switch]$KeepConfig,
   [switch]$AllowDowngrade,
+  [switch]$Managed,
   [string]$DshVersion = '0.1.1-rc.2'
 )
 
@@ -64,11 +65,18 @@ $script:Missing  = New-Object System.Collections.Generic.List[string]
 $script:Failed   = 0
 $script:NodeWasInstalled = $false
 $script:PathWasChanged  = $false
+# Managed install: the bootstrap from the distribution service sets these. The
+# machine is ours to configure, so config is fetched by token and applied without
+# asking, and an updater task is registered at the end.
+$DistBase    = if ($env:DSH_DIST_BASE)    { $env:DSH_DIST_BASE }    else { '' }
+$DistToken   = if ($env:DSH_DIST_TOKEN)   { $env:DSH_DIST_TOKEN }   else { '' }
+$DistVersion = if ($env:DSH_DIST_VERSION) { $env:DSH_DIST_VERSION } else { '' }
+if ($Managed) { $ReplaceConfig = $true; $TotalSteps = 11 } else { $TotalSteps = 10 }
 
 function Write-Step($text) {
   $script:StepNo++
   Write-Host ''
-  Write-Host ("[{0}/10] {1}" -f $script:StepNo, $text) -ForegroundColor Blue
+  Write-Host ("[{0}/{1}] {2}" -f $script:StepNo, $TotalSteps, $text) -ForegroundColor Blue
 }
 function Write-Info($text) { Write-Host ("      {0}" -f $text) }
 function Write-Ok($text)   { Write-Host '      ' -NoNewline; Write-Host '+' -ForegroundColor Green -NoNewline; Write-Host " $text" }
@@ -342,6 +350,30 @@ if ($Secrets) {
   if (-not (Test-Path -LiteralPath $Secrets)) { Die "secrets file not found: $Secrets" }
   Read-SecretFile $Secrets
   Write-Ok "loaded $Secrets"
+}
+
+# Managed machines get their keys from the distribution service over TLS, keyed to
+# their enrollment token. Nothing is typed, and nothing is carried by hand.
+if ($Managed -and $DistBase -and $DistToken -and -not $DryRun) {
+  try {
+    $bundle = Invoke-RestMethod -Uri "$DistBase/config/$DistToken" -TimeoutSec 40
+    $applied = 0
+    foreach ($group in @('credentials', 'endpoints')) {
+      $section = $bundle.$group
+      if (-not $section) { continue }
+      foreach ($prop in $section.PSObject.Properties) {
+        if ($prop.Name -notmatch '^[A-Z0-9_]+$') { continue }
+        if ($null -eq $prop.Value -or "$($prop.Value)" -eq '') { continue }
+        $Secret[$prop.Name] = "$($prop.Value)"
+        $applied++
+      }
+    }
+    $who = if ($bundle.enrollment -and $bundle.enrollment.name) { " (" + $bundle.enrollment.name + ")" } else { '' }
+    if ($applied -gt 0) { Write-Ok "configuration fetched for this machine$who" }
+    else { Write-Warn 'the distribution service returned no usable configuration' }
+  } catch {
+    Write-Warn "could not fetch configuration from $DistBase - installing without keys ($($_.Exception.Message))"
+  }
 }
 foreach ($k in ($SecretKeys + $EndpointKeys)) {
   $fromEnv = [Environment]::GetEnvironmentVariable($k)
@@ -647,6 +679,57 @@ if ($SkipQwen) {
   }
 }
 
+# ── managed updater ─────────────────────────────────────────────────────────
+
+if ($Managed -and -not $DryRun) {
+  Write-Step 'Managed updates'
+
+  $updDir = Join-Path $DshHome 'updater'
+  New-Item -ItemType Directory -Force -Path $updDir | Out-Null
+  New-Item -ItemType Directory -Force -Path (Join-Path $DshHome 'logs') | Out-Null
+  Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\updater\check-update.mjs') `
+    -Destination (Join-Path $updDir 'check-update.mjs') -Force
+
+  # This file is what makes the machine "managed": where to check, as whom, and
+  # what it currently runs. The updater rewrites `version` after each upgrade.
+  $managedPath = Join-Path $DshHome 'managed.json'
+  $managedJson = [ordered]@{
+    base      = $DistBase
+    token     = $DistToken
+    version   = if ($DistVersion) { $DistVersion } else { '0.0.0' }
+    installed = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  } | ConvertTo-Json
+  Set-Content -LiteralPath $managedPath -Value $managedJson -Encoding UTF8
+  Protect-File $managedPath
+  Write-Ok "enrolled for updates from $DistBase"
+
+  # A .cmd shim so `dsh-update` works from cmd.exe and PowerShell alike.
+  $updShim = Join-Path $LocalBin 'dsh-update.cmd'
+  Set-Content -LiteralPath $updShim -Encoding ASCII -Value @(
+    '@echo off',
+    ('"{0}" "{1}\check-update.mjs" %*' -f $NodeBin, $updDir)
+  )
+
+  # Every 6 hours, and once at logon, same cadence as the macOS LaunchAgent.
+  try {
+    $updAction = New-ScheduledTaskAction -Execute $NodeBin `
+      -Argument ('"{0}\check-update.mjs"' -f $updDir) -WorkingDirectory $updDir
+    $updTriggers = @(
+      (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME),
+      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) `
+        -RepetitionInterval (New-TimeSpan -Hours 6))
+    )
+    $updSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+      -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName 'DSH Update Check' -Action $updAction `
+      -Trigger $updTriggers -Settings $updSettings `
+      -Description 'Checks for a new managed DeepSeek Harness release' -Force | Out-Null
+    Write-Ok 'update check every 6 hours - you get a prompt when a new version ships'
+  } catch {
+    Write-Warn "could not register the update task ($($_.Exception.Message)); run dsh-update by hand"
+  }
+}
+
 # ── 9. dsh-setup helper + verification ──────────────────────────────────────
 
 Write-Step 'Verify'
@@ -737,7 +820,7 @@ if ($script:Warnings.Count -gt 0) {
   Write-Host ("{0} thing(s) need your attention:" -f $script:Warnings.Count) -ForegroundColor Yellow
   foreach ($w in $script:Warnings) { Write-Host "  * $w" }
 }
-if ($script:Missing.Count -gt 0) {
+if ($script:Missing.Count -gt 0 -and -not $Managed) {
   Write-Host ''
   Write-Host 'Blank credentials - put them in a file and run: dsh-setup reconfigure --secrets <file>' -ForegroundColor DarkGray
   foreach ($m in $script:Missing) { Write-Host "  $m" }

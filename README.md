@@ -4,6 +4,65 @@ Installs DeepSeek Harness with the full customized setup — providers, plugins,
 servers, agent preset, model-picker patches and the Qwen desktop bridge — on a
 fresh **macOS** or **Windows** machine.
 
+## Managed install (the normal way)
+
+One line, nothing else. No secrets file, no second terminal, no re-run:
+
+```bash
+curl -fsSL https://get.xovi.pro/i/<token> | bash          # macOS / Linux
+```
+```powershell
+irm https://get.xovi.pro/w/<token> | iex                  # Windows
+```
+
+The token is the install. It identifies the machine to the distribution service,
+which hands back that machine's credentials and endpoints over TLS at install time
+and on every update — so nothing is ever carried by hand. The installer takes over
+whatever DSH is already there (backing up what it replaces), puts `~/.local/bin` on
+PATH so `dsh` and `dsh-setup` work in the next shell, and registers an updater that
+checks every 6 hours.
+
+When a new release is published, the machine shows a native prompt — `1.0.2 → 1.0.3`
+with **Later** and **Update now** — and one click applies it. `dsh-update` checks
+immediately; `dsh-update --apply` skips the prompt.
+
+### Operating it
+
+```bash
+./tools/dsh-publish.sh 1.0.3 "what changed"     # release this working tree
+./tools/dsh-publish.sh --enroll "Name of Mac"   # mint an install link
+./tools/dsh-publish.sh --profile ayush          # push this Mac's live keys as the
+                                                # config every enrolled machine gets
+./tools/dsh-publish.sh --list                   # who is enrolled, last check-in
+./tools/dsh-publish.sh --revoke <token>         # cut a machine off
+```
+
+`--profile` reads the live `~/.dsh` on the machine you run it from, so rotating a key
+is: change it here, run `--profile`, done — every enrolled machine picks it up on its
+next update.
+
+### The service
+
+`get.xovi.pro`, systemd unit `dsh-dist` on the VPS, Traefik dynamic route, Let's
+Encrypt via the Cloudflare DNS challenge. It binds the docker bridge gateway
+(`172.18.0.1:8790`) and loopback only, so Traefik is the sole way in and `/admin/*`
+is never publicly reachable. The admin token is generated on the box and stays there;
+`dsh-publish` reads it over SSH, so it is never stored on a laptop.
+
+| route | purpose |
+| --- | --- |
+| `/i/<token>` `/w/<token>` | bootstrap with the token baked in |
+| `/manifest.json` | current version, notes, sha256 for both artifacts |
+| `/config/<token>` | that machine's credentials + endpoints |
+| `/payload/<version>.tar.gz` `.zip` | the release |
+| `/admin/release` `/admin/enroll` `/admin/profile` `/admin/revoke` | operator, bearer-gated |
+
+A release ships two containers of the same tree: `.tar.gz` for macOS/Linux and
+`.zip` for Windows, because `Expand-Archive` is built into PowerShell and `tar` is
+not dependable on older builds.
+
+## Manual install
+
 ## Install
 
 **macOS / Linux** — one command, no login:

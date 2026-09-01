@@ -131,18 +131,29 @@ case "${1:-}" in
     done
     ok "scripts parse"
 
-    TAR="$(mktemp -d)/dsh-$VERSION.tar.gz"
+    WORK="$(mktemp -d)"
+    TAR="$WORK/dsh-$VERSION.tar.gz"
+    ZIP="$WORK/dsh-$VERSION.zip"
     ( cd "$HERE" && tar czf "$TAR" --exclude .git --exclude '.DS_Store' --exclude 'dist-server' . )
-    SIZE="$(( $(wc -c < "$TAR") / 1024 ))"
-    info "packed ${SIZE}KB"
+    # Windows gets a zip: PowerShell's Expand-Archive is built in, tar is not
+    # dependable on older builds. Same tree, two containers.
+    ( cd "$HERE" && zip -rq "$ZIP" . -x '.git/*' -x '*.DS_Store' -x 'dist-server/*' )
+    info "packed $(( $(wc -c < "$TAR") / 1024 ))KB tar.gz + $(( $(wc -c < "$ZIP") / 1024 ))KB zip"
+
+    ENC_NOTES="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]||""))' "$NOTES")"
 
     # Upload through the VPS: the admin port is not exposed publicly.
-    scp -q -o BatchMode=yes "$TAR" "$VPS:/tmp/dsh-release.tar.gz"
-    ENC_NOTES="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]||""))' "$NOTES")"
-    ssh -o BatchMode=yes "$VPS" \
-      "TOK=\$(cat /opt/dsh-dist/admin.token); curl -sS -X POST -H \"Authorization: Bearer \$TOK\" --data-binary @/tmp/dsh-release.tar.gz 'http://127.0.0.1:8790/admin/release?version=$VERSION&notes=$ENC_NOTES'; rm -f /tmp/dsh-release.tar.gz" \
-      | sed 's/^/  /'
-    rm -rf "$(dirname "$TAR")"
+    for kind in tar.gz zip; do
+      case "$kind" in
+        tar.gz) SRC="$TAR" ;;
+        zip) SRC="$ZIP" ;;
+      esac
+      scp -q -o BatchMode=yes "$SRC" "$VPS:/tmp/dsh-release.$kind"
+      ssh -o BatchMode=yes "$VPS" \
+        "TOK=\$(cat /opt/dsh-dist/admin.token); curl -sS -X POST -H \"Authorization: Bearer \$TOK\" --data-binary @/tmp/dsh-release.$kind 'http://127.0.0.1:8790/admin/release?version=$VERSION&kind=$kind&notes=$ENC_NOTES'; rm -f /tmp/dsh-release.$kind" \
+        | sed "s/^/  /"
+    done
+    rm -rf "$WORK"
 
     printf '\n'
     ok "released $VERSION"
