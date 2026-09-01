@@ -668,13 +668,23 @@ function Protect-File($path) {
   if ($DryRun -or -not (Test-Path -LiteralPath $path)) { return }
   try {
     $acl = Get-Acl -LiteralPath $path
+    # Breaking inheritance with copy=$false already discards the inherited rules.
+    # Calling RemoveAccessRule on an inherited rule throws, which is why every one
+    # of these used to fail - so only explicit rules are removed, and afterwards.
     $acl.SetAccessRuleProtection($true, $false)
-    foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    foreach ($rule in @($acl.Access)) {
+      if (-not $rule.IsInherited) { $acl.RemoveAccessRuleSpecific($rule) }
+    }
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-      $me, 'FullControl', 'Allow')))
+      $me,
+      [System.Security.AccessControl.FileSystemRights]::FullControl,
+      [System.Security.AccessControl.AccessControlType]::Allow)))
     Set-Acl -LiteralPath $path -AclObject $acl
-  } catch { Write-Warn ("could not lock down {0}" -f (Split-Path -Leaf $path)) }
+  } catch {
+    # Hardening, not correctness: the file is already in the user's own profile.
+    Write-Info ("{0} left with default permissions ({1})" -f (Split-Path -Leaf $path), $_.Exception.Message)
+  }
 }
 
 foreach ($d in @((Join-Path $DshHome 'logs'), $PresetDir, $InstallerHome, $ProfileDir, $LocalBin)) {
@@ -750,6 +760,30 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProfileDir 'cordis.yml')) -and -not
 Invoke-Step {
   Copy-Item -LiteralPath (Join-Path $SrcDir 'payload\profile-web\package.json') -Destination (Join-Path $ProfileDir 'package.json') -Force
 } 'copy package.json'
+
+# @anionex/dsh-vision-toolkit installs cleanly but its CLIENT bundle refuses to
+# load in the browser on Windows ("bundle script .../client.js failed to load"),
+# and one failing client plugin takes the whole plugin load with it - the UI then
+# opens with "Failed to load plugins". It is dropped here rather than shipped
+# broken; macOS keeps it. Remove this block when upstream loads on Windows.
+if (-not $DryRun) {
+  $dropped = Invoke-NodeScript @'
+import fs from "node:fs";
+const file = process.argv[2];
+const drop = "@anionex/dsh-vision-toolkit";
+const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+let changed = false;
+if (pkg.dependencies && pkg.dependencies[drop]) { delete pkg.dependencies[drop]; changed = true; }
+const bundles = pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles;
+if (Array.isArray(bundles) && bundles.includes(drop)) {
+  pkg.dsh.profile.bundles = bundles.filter((b) => b !== drop);
+  changed = true;
+}
+if (changed) fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+process.exit(changed ? 0 : 3);
+'@ @((Join-Path $ProfileDir 'package.json'))
+  if ($dropped -eq 0) { Write-Info 'vision toolkit left out - its client bundle does not load on Windows yet' }
+}
 
 # One bundle is a git dependency and pnpm needs a working git to resolve it, or the
 # whole install fails and none of the ten bundles land. Windows ships no git.
@@ -957,7 +991,7 @@ if ($SkipQwen) {
     try {
       Invoke-WebRequest -Uri 'http://127.0.0.1:3083/health' -TimeoutSec 3 -UseBasicParsing | Out-Null
       $bridgeAlready = $true
-      Write-Warn 'something already serves :3083 - not registering a second bridge'
+      Write-Ok 'bridge already running on :3083 - leaving it alone'
     } catch {}
   }
   if (-not $DryRun -and -not $bridgeAlready) {
@@ -1075,6 +1109,7 @@ if (-not $DryRun) {
   if (-not $DshCmd) { $DshCmd = Get-ToolPath 'dsh' }
   if ($DshCmd) {
     New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
     $dshShim = Join-Path $LocalBin 'dsh.cmd'
     Set-Content -LiteralPath $dshShim -Encoding ASCII -Value @(
@@ -1082,21 +1117,62 @@ if (-not $DryRun) {
       ('"{0}" %*' -f $DshCmd)
     )
 
+    # The server itself, run by a logon Scheduled Task so it behaves like the Qwen
+    # bridge and the AgentRouter proxy: always up, survives a reboot, and has no
+    # console window anyone can close by accident. `dsh web` started from a
+    # console dies with that console, which is exactly what happened.
+    $svcPs1 = Join-Path $LocalBin 'dsh-web-service.ps1'
+    Set-Content -LiteralPath $svcPs1 -Encoding UTF8 -Value @(
+      '# Runs the DeepSeek Harness web server. Started by the "DSH Web" task.',
+      ('$env:DSH_HOME = "{0}"' -f $DshHome),
+      ('& "{0}" web' -f $DshCmd)
+    )
+
+    $webTask = 'DSH Web'
+    $taskOk = $false
+    try {
+      $webAction = New-ScheduledTaskAction -Execute $psExe `
+        -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $svcPs1) `
+        -WorkingDirectory $UserHome
+      $webTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+      $webSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+      Register-ScheduledTask -TaskName $webTask -Action $webAction -Trigger $webTrigger `
+        -Settings $webSettings -Description 'Keeps the DeepSeek Harness web UI running' -Force | Out-Null
+      $taskOk = $true
+      Write-Ok 'web UI runs at every logon (Scheduled Task "DSH Web")'
+    } catch {
+      Write-Warn ("could not register the web task ({0}) - the launcher starts it instead" -f $_.Exception.Message)
+    }
+
+    # The launcher: make sure the server is up, then open the browser. It is what
+    # the Desktop shortcut runs, and it never leaves a window behind.
     $script:WebLauncher = Join-Path $LocalBin 'dsh-web.ps1'
     Set-Content -LiteralPath $script:WebLauncher -Encoding UTF8 -Value @(
-      '# Start the DeepSeek Harness web UI, wait for it, then open the browser.',
+      '# Open the DeepSeek Harness web UI, starting the server first if it is down.',
       "`$ErrorActionPreference = 'SilentlyContinue'",
-      ('$dsh = "{0}"' -f $DshCmd),
-      ("`$url = 'http://127.0.0.1:3080'"),
+      ('$url  = "{0}"' -f 'http://127.0.0.1:3080'),
+      ('$task = "{0}"' -f $webTask),
+      ('$svc  = "{0}"' -f $svcPs1),
+      ('$ps   = "{0}"' -f $psExe),
       'function Test-Up {',
       '  try { Invoke-WebRequest -Uri $url -TimeoutSec 2 -UseBasicParsing | Out-Null; return $true }',
       '  catch { return $false }',
       '}',
       'if (-not (Test-Up)) {',
-      "  Start-Process -FilePath `$dsh -ArgumentList 'web' -WindowStyle Minimized",
-      '  foreach ($i in 1..60) { Start-Sleep -Seconds 1; if (Test-Up) { break } }',
+      '  $started = $false',
+      '  try { Start-ScheduledTask -TaskName $task -ErrorAction Stop; $started = $true } catch { }',
+      '  if (-not $started) {',
+      "    Start-Process -FilePath `$ps -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',`$svc)",
+      '  }',
+      '  foreach ($i in 1..90) { Start-Sleep -Seconds 1; if (Test-Up) { break } }',
       '}',
-      'Start-Process $url'
+      'if (Test-Up) { Start-Process $url }',
+      'else {',
+      '  Add-Type -AssemblyName System.Windows.Forms',
+      "  [System.Windows.Forms.MessageBox]::Show('DeepSeek Harness did not start. Open PowerShell and run:  dsh web', 'DeepSeek Harness') | Out-Null",
+      '}'
     )
 
     Set-Content -LiteralPath (Join-Path $LocalBin 'dsh-web.cmd') -Encoding ASCII -Value @(
@@ -1104,7 +1180,13 @@ if (-not $DryRun) {
       ('powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $script:WebLauncher)
     )
 
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($taskOk) {
+      try { Start-ScheduledTask -TaskName $webTask } catch { }
+    } else {
+      Start-Process -FilePath $psExe -ArgumentList @(
+        '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $svcPs1)
+    }
+
     $where = @()
     try {
       $ws = New-Object -ComObject WScript.Shell
@@ -1115,7 +1197,7 @@ if (-not $DryRun) {
         $sc.TargetPath       = $psExe
         $sc.Arguments        = ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $script:WebLauncher)
         $sc.WorkingDirectory = $LocalBin
-        $sc.Description      = 'Start the DeepSeek Harness web UI'
+        $sc.Description      = 'Open the DeepSeek Harness web UI'
         $sc.IconLocation     = ((Resolve-NodeExe) + ',0')
         $sc.Save()
         $where += $(if ($folder -eq 'Programs') { 'Start menu' } else { 'Desktop' })
@@ -1124,7 +1206,6 @@ if (-not $DryRun) {
       Write-Warn ("could not create the shortcut ({0}) - start it with: dsh web" -f $_.Exception.Message)
     }
     if ($where.Count) { Write-Ok ('"DeepSeek Harness" on your ' + ($where -join ' and ')) }
-    Write-Ok 'dsh and dsh-web shims installed'
   }
 }
 
