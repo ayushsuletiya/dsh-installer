@@ -1,7 +1,7 @@
 <#
 DeepSeek Harness — one-click install of Ayush's full setup (Windows 10/11).
 
-    irm https://raw.githubusercontent.com/<owner>/dsh-installer/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/ayushsuletiya/dsh-installer/main/install.ps1 | iex
 
 or, from a clone:
 

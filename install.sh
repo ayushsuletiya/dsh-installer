@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DeepSeek Harness — one-click install of Ayush's full setup (macOS / Linux).
 #
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/dsh-installer/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ayushsuletiya/dsh-installer/main/install.sh | bash
 #
 # or, from a clone:
 #
