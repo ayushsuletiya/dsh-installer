@@ -91,11 +91,33 @@ if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
   $SrcDir = Split-Path -Parent $PSCommandPath
 }
 if (-not $SrcDir -or -not (Test-Path -LiteralPath (Join-Path $SrcDir 'payload'))) {
-  if (-not (Test-CommandExists 'git')) { Die 'git is required when running from a pipe' }
   $CloneDir = Join-Path $env:TEMP "dsh-installer-$Stamp"
   Write-Host 'fetching installer payload...' -ForegroundColor DarkGray
-  & git clone --depth 1 --branch $RepoBranch $RepoUrl $CloneDir 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die "could not clone $RepoUrl" }
+  # Windows ships no git, so prefer the plain zipball: Invoke-WebRequest and
+  # Expand-Archive are both built in. git is only a fallback.
+  $ok = $false
+  try {
+    $zipUrl = ($RepoUrl -replace '\.git$', '') + "/archive/refs/heads/$RepoBranch.zip"
+    $zipPath = Join-Path $env:TEMP "dsh-installer-$Stamp.zip"
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -TimeoutSec 180 -UseBasicParsing
+    $unpack = Join-Path $env:TEMP "dsh-installer-unpack-$Stamp"
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $unpack -Force
+    # GitHub wraps everything in <repo>-<branch>\; hoist that one directory up.
+    $inner = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
+    if ($inner) {
+      Move-Item -LiteralPath $inner.FullName -Destination $CloneDir
+      $ok = Test-Path -LiteralPath (Join-Path $CloneDir 'payload')
+    }
+    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue
+  } catch { $ok = $false }
+
+  if (-not $ok) {
+    if (-not (Test-CommandExists 'git')) { Die "could not download the payload from $RepoUrl and git is not available" }
+    Remove-Item -LiteralPath $CloneDir -Recurse -Force -ErrorAction SilentlyContinue
+    & git clone --depth 1 --branch $RepoBranch $RepoUrl $CloneDir 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "could not fetch the payload from $RepoUrl" }
+  }
   $SrcDir = $CloneDir
 }
 if (-not (Test-Path -LiteralPath (Join-Path $SrcDir 'payload'))) { Die 'payload\ not found next to install.ps1' }

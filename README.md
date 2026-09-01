@@ -25,7 +25,7 @@ cp secrets.example.env ~/dsh-secrets.env   # fill in the keys and endpoints you 
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/ayushsuletiya/dsh-installer/main/install.ps1 -OutFile "$env:TEMP\dsh-install.ps1"
-powershell -ExecutionPolicy Bypass -File "$env:TEMP\dsh-install.ps1" -Secrets $HOME\dsh-secrets.env
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\dsh-install.ps1" -Secrets "$HOME\dsh-secrets.env"
 ```
 
 or from a clone:
@@ -34,7 +34,7 @@ or from a clone:
 git clone https://github.com/ayushsuletiya/dsh-installer.git $HOME\dsh-installer
 cd $HOME\dsh-installer
 copy secrets.example.env $HOME\dsh-secrets.env
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Secrets $HOME\dsh-secrets.env
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Secrets "$HOME\dsh-secrets.env"
 ```
 
 Then: `dsh web`.

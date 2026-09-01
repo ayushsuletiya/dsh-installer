@@ -107,12 +107,25 @@ if [ -n "$SCRIPT_SELF" ] && [ -f "$SCRIPT_SELF" ]; then
   SRC_DIR="$(cd "$(dirname "$SCRIPT_SELF")" && pwd)"
 fi
 if [ -z "$SRC_DIR" ] || [ ! -d "$SRC_DIR/payload" ]; then
-  command -v git >/dev/null 2>&1 || die "git is required when running from a pipe"
   CLONE_DIR="${TMPDIR:-/tmp}/dsh-installer-$STAMP"
   printf '%sfetching installer payload…%s\n' "$C_DIM" "$C_RESET"
-  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CLONE_DIR" >/dev/null 2>&1 \
-    || die "could not clone $REPO_URL"
-  SRC_DIR="$CLONE_DIR"
+  # A factory-fresh Mac has no git: /usr/bin/git is a stub that pops the Xcode
+  # Command Line Tools installer and blocks. So prefer the plain tarball, which
+  # needs nothing but curl and tar, and only fall back to git.
+  TARBALL_URL="$(printf '%s' "$REPO_URL" | sed -E 's#\.git$##')/archive/refs/heads/$REPO_BRANCH.tar.gz"
+  mkdir -p "$CLONE_DIR"
+  if curl -fsSL --max-time 180 "$TARBALL_URL" 2>/dev/null \
+       | tar xz -C "$CLONE_DIR" --strip-components 1 2>/dev/null \
+     && [ -d "$CLONE_DIR/payload" ]; then
+    SRC_DIR="$CLONE_DIR"
+  elif command -v git >/dev/null 2>&1; then
+    rm -rf "$CLONE_DIR"
+    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CLONE_DIR" >/dev/null 2>&1 \
+      || die "could not fetch the payload from $REPO_URL"
+    SRC_DIR="$CLONE_DIR"
+  else
+    die "could not download the payload ($TARBALL_URL) and git is not available"
+  fi
 fi
 [ -d "$SRC_DIR/payload" ] || die "payload/ not found next to install.sh"
 
