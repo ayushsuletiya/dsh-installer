@@ -262,107 +262,123 @@ is ever copied by hand.
 // One line for the human: it inspects the running web UI the way the browser
 // does, then posts the findings here. Nothing to read, nothing to paste.
 
+const DIAG_PS1 = [
+  "# DeepSeek Harness - Windows diagnostic. Reports back automatically.",
+  "& {",
+  "  $ErrorActionPreference = 'Continue'",
+  "  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}",
+  "  $lines = New-Object System.Collections.Generic.List[string]",
+  "  function A($t) { $lines.Add(\"$t\") | Out-Null; Write-Host $t }",
+  "  function Test-Port {",
+  "    $c = New-Object Net.Sockets.TcpClient",
+  "    try { $c.Connect('127.0.0.1', 3080); $c.Close(); return $true } catch { return $false }",
+  "  }",
+  "",
+  "  A (\"dsh-diag2 \" + (Get-Date -Format s) + \"  ps \" + $PSVersionTable.PSVersion + \"  os \" + [Environment]::OSVersion.Version)",
+  "",
+  "  $userHome = $env:USERPROFILE",
+  "  $dshHome  = Join-Path $userHome '.dsh'",
+  "  A (\"--- \" + $dshHome)",
+  "  foreach ($f in (Get-ChildItem -LiteralPath $dshHome -Force -ErrorAction SilentlyContinue)) {",
+  "    if ($f.PSIsContainer) { A (\"  \" + $f.Name + \"\\\") } else { A (\"  \" + $f.Name + \"  \" + $f.Length + \"b\") }",
+  "  }",
+  "",
+  "  $dsh = Join-Path $env:APPDATA 'npm\\dsh.cmd'",
+  "  if (-not (Test-Path -LiteralPath $dsh)) { $dsh = Join-Path $userHome '.local\\bin\\dsh.cmd' }",
+  "  A (\"dsh \" + $dsh + \" exists \" + (Test-Path -LiteralPath $dsh))",
+  "  A (\"already listening on 3080: \" + (Test-Port))",
+  "",
+  "  # The page loads and then the bundle requests fail, so the server is dying",
+  "  # seconds after it starts. Run it in the foreground with its output captured -",
+  "  # its own stderr is the answer.",
+  "  $o = Join-Path $env:TEMP 'dsh-web-out.log'",
+  "  $e = Join-Path $env:TEMP 'dsh-web-err.log'",
+  "  Remove-Item -LiteralPath $o -Force -ErrorAction SilentlyContinue",
+  "  Remove-Item -LiteralPath $e -Force -ErrorAction SilentlyContinue",
+  "  $env:DSH_HOME = $dshHome",
+  "  $proc = $null",
+  "  try {",
+  "    $proc = Start-Process -FilePath $dsh -ArgumentList 'web' -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e",
+  "    A (\"started pid \" + $proc.Id)",
+  "  } catch { A (\"could not start: \" + $_.Exception.Message) }",
+  "",
+  "  $upAt = -1",
+  "  for ($i = 1; $i -le 50; $i++) {",
+  "    Start-Sleep -Milliseconds 800",
+  "    if (Test-Port) { $upAt = $i; break }",
+  "  }",
+  "  A (\"port came up at poll \" + $upAt + \" (of 50, 0.8s each)\")",
+  "",
+  "  if ($upAt -ge 0) {",
+  "    try {",
+  "      $r = Invoke-WebRequest -Uri 'http://127.0.0.1:3080/' -TimeoutSec 15 -UseBasicParsing",
+  "      $html = \"$($r.Content)\"",
+  "      A (\"index \" + $r.StatusCode + \" \" + $html.Length + \"b\")",
+  "      $k = 'globalThis[\"__DSH_BOOT__\"] = '",
+  "      $i2 = $html.IndexOf($k)",
+  "      if ($i2 -lt 0) { A \"no boot manifest in index\" }",
+  "      else {",
+  "        $s = $i2 + $k.Length; $d = 0; $x = $s",
+  "        for (; $x -lt $html.Length; $x++) {",
+  "          $ch = $html[$x]",
+  "          if ($ch -eq '{') { $d++ } elseif ($ch -eq '}') { $d--; if ($d -eq 0) { $x++; break } }",
+  "        }",
+  "        $boot = $html.Substring($s, $x - $s) | ConvertFrom-Json",
+  "        $entries = @($boot.entries)",
+  "        A (\"boot entries \" + $entries.Count)",
+  "        $ok = 0; $bad = 0",
+  "        foreach ($en in $entries) {",
+  "          try {",
+  "            $br = Invoke-WebRequest -Uri ('http://127.0.0.1:3080' + $en.url) -TimeoutSec 10 -UseBasicParsing",
+  "            if ($br.StatusCode -eq 200) { $ok++ } else { $bad++ }",
+  "          } catch {",
+  "            $bad++",
+  "            if ($bad -le 3) { A (\"  BAD \" + $en.id + \" :: \" + $_.Exception.Message) }",
+  "          }",
+  "        }",
+  "        A (\"bundles ok \" + $ok + \" bad \" + $bad)",
+  "      }",
+  "    } catch { A (\"index FAILED \" + $_.Exception.Message) }",
+  "",
+  "    Start-Sleep -Seconds 6",
+  "    A (\"port still up 6s later: \" + (Test-Port))",
+  "  }",
+  "",
+  "  if ($proc) {",
+  "    $gone = $false",
+  "    try { $gone = $proc.HasExited } catch { }",
+  "    A (\"launcher process exited: \" + $gone)",
+  "    if ($gone) { try { A (\"  exit code \" + $proc.ExitCode) } catch { } }",
+  "  }",
+  "  $nodes = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -match 'dsh' })",
+  "  A (\"dsh node processes now \" + $nodes.Count)",
+  "",
+  "  if (Test-Path -LiteralPath $o) {",
+  "    A (\"--- stdout \" + (Get-Item -LiteralPath $o).Length + \"b\")",
+  "    foreach ($l in (Get-Content -LiteralPath $o -Tail 40 -ErrorAction SilentlyContinue)) { A (\"  \" + $l) }",
+  "  } else { A \"--- stdout missing\" }",
+  "  if (Test-Path -LiteralPath $e) {",
+  "    A (\"--- stderr \" + (Get-Item -LiteralPath $e).Length + \"b\")",
+  "    foreach ($l in (Get-Content -LiteralPath $e -Tail 40 -ErrorAction SilentlyContinue)) { A (\"  \" + $l) }",
+  "  } else { A \"--- stderr missing\" }",
+  "",
+  "  if ($proc) { try { & taskkill /PID $proc.Id /T /F *> $null } catch { } }",
+  "",
+  "  try {",
+  "    Invoke-RestMethod -Uri '__BASE__/report/__TOKEN__' -Method Post -Body ($lines -join [Environment]::NewLine) -ContentType 'text/plain; charset=utf-8' -TimeoutSec 30 | Out-Null",
+  "    Write-Host ''",
+  "    Write-Host 'Sent. Nothing to copy.' -ForegroundColor Green",
+  "  } catch {",
+  "    Write-Host ''",
+  "    Write-Host ('Could not send: ' + $_.Exception.Message) -ForegroundColor Yellow",
+  "  }",
+  "}"
+].join("\n") + "\n";
+
+// One line for the human: it runs the web server with its output captured, walks
+// every plugin bundle the browser would fetch, then posts the findings here.
 function diagPs1(token) {
-  return `# DeepSeek Harness - Windows diagnostic. Reports back automatically.
-& {
-  $ErrorActionPreference = 'Continue'
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
-  $lines = New-Object System.Collections.Generic.List[string]
-  function A($t) { $lines.Add("$t") | Out-Null; Write-Host $t }
-
-  A ("dsh-diag " + (Get-Date -Format s) + "  ps " + $PSVersionTable.PSVersion + "  os " + [Environment]::OSVersion.Version)
-
-  # what is listening on 3080, and which processes think they are dsh
-  try {
-    $conns = Get-NetTCPConnection -LocalPort 3080 -State Listen -ErrorAction Stop
-    foreach ($c in $conns) { A ("listen 3080 pid " + $c.OwningProcess) }
-  } catch { A "listen 3080 none" }
-  $procs = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-             Where-Object { $_.CommandLine -and $_.CommandLine -match 'dsh' })
-  A ("dsh node processes " + $procs.Count)
-  foreach ($p in $procs) {
-    $cl = "$($p.CommandLine)"
-    if ($cl.Length -gt 150) { $cl = $cl.Substring(0, 150) }
-    A ("  pid " + $p.ProcessId + " | " + $cl)
-  }
-
-  foreach ($t in @('DSH Web', 'DSH Qwen Bridge', 'DSH AgentRouter Proxy', 'DSH Update Check')) {
-    try { $ts = Get-ScheduledTask -TaskName $t -ErrorAction Stop; A ("task '" + $t + "' " + $ts.State) }
-    catch { A ("task '" + $t + "' MISSING") }
-  }
-
-  # the page, and the plugin bundles it asks the browser to load
-  $html = ''
-  try {
-    $r = Invoke-WebRequest -Uri 'http://127.0.0.1:3080/' -TimeoutSec 15 -UseBasicParsing
-    $html = "$($r.Content)"
-    A ("index " + $r.StatusCode + " " + $html.Length + "b")
-  } catch { A ("index FAILED " + $_.Exception.Message) }
-
-  if ($html) {
-    $k = 'globalThis["__DSH_BOOT__"] = '
-    $i = $html.IndexOf($k)
-    if ($i -lt 0) { A "boot manifest NOT FOUND in index" }
-    else {
-      $s = $i + $k.Length; $d = 0; $e = $s
-      for (; $e -lt $html.Length; $e++) {
-        $ch = $html[$e]
-        if ($ch -eq '{') { $d++ } elseif ($ch -eq '}') { $d--; if ($d -eq 0) { $e++; break } }
-      }
-      $boot = $null
-      try { $boot = $html.Substring($s, $e - $s) | ConvertFrom-Json } catch { A ("boot parse failed " + $_.Exception.Message) }
-      if ($boot) {
-        $entries = @($boot.entries)
-        A ("boot rev " + $boot.rev + " entries " + $entries.Count)
-        $ok = 0; $bad = 0
-        foreach ($en in $entries) {
-          $u = 'http://127.0.0.1:3080' + $en.url
-          try {
-            $br = Invoke-WebRequest -Uri $u -TimeoutSec 15 -UseBasicParsing
-            if ($br.StatusCode -eq 200) { $ok++ } else { $bad++; A ("  BAD " + $en.id + " -> " + $br.StatusCode) }
-          } catch {
-            $bad++
-            $code = ''
-            try { $code = "$($_.Exception.Response.StatusCode.value__)" } catch {}
-            if ($bad -le 6) { A ("  BAD " + $en.id + " -> " + $code + " " + $_.Exception.Message) }
-          }
-        }
-        A ("bundles ok " + $ok + " bad " + $bad)
-      }
-    }
-  }
-
-  # where dsh and its plugins actually live
-  $npmBin = Join-Path $env:APPDATA 'npm'
-  A ("global bin " + $npmBin + " exists " + (Test-Path -LiteralPath $npmBin))
-  $profileNm = Join-Path $env:USERPROFILE '.dsh\\profiles\\web\\node_modules'
-  A ("profile node_modules exists " + (Test-Path -LiteralPath $profileNm))
-  foreach ($rel in @('@deepseek-ai\\dsh-typert-registry\\lib\\client.js')) {
-    foreach ($root in @((Join-Path $npmBin 'node_modules\\@deepseek-ai\\dsh\\node_modules'), $profileNm, (Join-Path $env:USERPROFILE '.dsh\\profiles\\node_modules'))) {
-      $p = Join-Path $root $rel
-      if (Test-Path -LiteralPath $p) { A ("found " + $p + " " + (Get-Item -LiteralPath $p).Length + "b") }
-    }
-  }
-
-  $log = Join-Path $env:USERPROFILE '.dsh\\logs'
-  if (Test-Path -LiteralPath $log) {
-    $newest = Get-ChildItem -LiteralPath $log -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($newest) {
-      A ("--- tail " + $newest.Name)
-      foreach ($l in (Get-Content -LiteralPath $newest.FullName -Tail 25 -ErrorAction SilentlyContinue)) { A ("  " + $l) }
-    }
-  }
-
-  try {
-    Invoke-RestMethod -Uri '${PUBLIC_BASE}/report/${token}' -Method Post -Body ($lines -join "\`n") -ContentType 'text/plain; charset=utf-8' -TimeoutSec 30 | Out-Null
-    Write-Host ''
-    Write-Host 'Sent. Nothing to copy.' -ForegroundColor Green
-  } catch {
-    Write-Host ''
-    Write-Host ('Could not send the report: ' + $_.Exception.Message) -ForegroundColor Yellow
-  }
-}
-`;
+  return DIAG_PS1.split("__BASE__").join(PUBLIC_BASE).split("__TOKEN__").join(token);
 }
 
 // ---------- routes ----------
