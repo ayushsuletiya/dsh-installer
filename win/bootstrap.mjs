@@ -88,12 +88,30 @@ function mkdirp(...parts) {
   return dir;
 }
 
-/** Replace dest with src, like `rsync -a --delete`. Only ever called on app-owned dirs. */
+/**
+ * Replace dest with src, like `rsync -a --delete`. Only ever called on app-owned
+ * dirs.
+ *
+ * Symlinks are skipped rather than copied. A copied link is wrong twice over: a zip
+ * cannot carry a Windows link faithfully, and the links dsh cares about point at
+ * absolute paths on the machine that built the tree.
+ */
 function mirror(src, dest) {
   if (!fs.existsSync(src)) return false;
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.cpSync(src, dest, { recursive: true, force: true, dereference: false });
+  fs.cpSync(src, dest, {
+    recursive: true,
+    force: true,
+    dereference: false,
+    filter: (from) => {
+      try {
+        return !fs.lstatSync(from).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    },
+  });
   return true;
 }
 
@@ -156,6 +174,11 @@ if (current !== VERSION) {
   if (current) say(`  updating profile: ${current} -> ${VERSION}`);
   mirror(path.join(BAKED, "profiles"), path.join(DSH_HOME, "profiles"));
   mirror(path.join(BAKED, ".agent-presets"), path.join(DSH_HOME, ".agent-presets"));
+  // profiles/node_modules is dsh's own flat fallback: ~200 links into the dsh
+  // install by absolute path. dsh rebuilds it at startup and refuses to start if it
+  // finds a real directory in place of one of its links, so whatever is here now is
+  // either wrong or stale. Removing it is the fix; healing it is dsh's job.
+  fs.rmSync(path.join(DSH_HOME, "profiles", "node_modules"), { recursive: true, force: true });
   fs.writeFileSync(stamp, `${VERSION}\n`);
   ok(`profile and presets from ${VERSION}`);
 } else {

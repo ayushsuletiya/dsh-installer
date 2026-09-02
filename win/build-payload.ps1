@@ -32,6 +32,7 @@ $Inst     = Join-Path $Stage 'installer'
 
 function Step($t) { Write-Host ''; Write-Host "== $t" -ForegroundColor Cyan }
 function Ok($t)   { Write-Host "   + $t" -ForegroundColor Green }
+function Warn($t) { Write-Host "   ! $t" -ForegroundColor Yellow }
 function Note($t) { Write-Host "   . $t" -ForegroundColor DarkGray }
 
 # A native command's stderr must never be treated as failure: Windows PowerShell
@@ -161,11 +162,37 @@ Ok "$bundles packages under the profile"
 
 Step 'model-picker patch'
 # Exit 4 means "this dsh is not the version the patch was cut for" — the picker
-# still works, so it is not a build failure.
-Run $NodeExe @(
-  (Join-Path $Inst 'tools\patch-model-selector.mjs'),
-  '--dsh-root', (Join-Path $App 'node_modules\@deepseek-ai\dsh')
-) $Stage @(0, 4)
+# still works, so it is not a build failure. The root is the app directory, not the
+# dsh package: npm installs a flat tree, so dsh-client-ui-model-selection is a
+# SIBLING of dsh rather than nested inside it, and pointing at the package misses it.
+$patched = $false
+foreach ($root in @($App, (Join-Path $App 'node_modules\@deepseek-ai\dsh'))) {
+  $code = Run $NodeExe @(
+    (Join-Path $Inst 'tools\patch-model-selector.mjs'), '--dsh-root', $root
+  ) $Stage @(0, 4)
+  if ($code -eq 0) { $patched = $true; break }
+}
+if ($patched) { Ok 'model picker has search and collapsible groups' }
+else { Warn 'model-picker patch skipped (the picker still works)' }
+
+# ── the machine-specific links must not ship ────────────────────────────────
+# $DSH_HOME/profiles/node_modules is a flat fallback of ~200 symlinks into the dsh
+# install's own node_modules, by absolute path. dsh rebuilds it at startup, but
+# refuses to start if it finds a real directory where one of its links belongs —
+# which is exactly what a zip round-trip produces. So it is removed here and healed
+# there.
+Step 'strip machine-specific links'
+$fallback = Join-Path $Baked 'profiles\node_modules'
+if (Test-Path -LiteralPath $fallback) {
+  Run $NodeExe @((Join-Path $PSScriptRoot 'strip-links.mjs'), $fallback) $Stage
+  Remove-Item -LiteralPath $fallback -Recurse -Force -ErrorAction SilentlyContinue
+  Ok 'dropped profiles\node_modules (dsh recreates it on first run)'
+}
+Run $NodeExe @((Join-Path $PSScriptRoot 'strip-links.mjs'), $Stage) $Stage
+# A tree that still contains a link cannot survive being zipped and unzipped
+# somewhere else, so refuse to package one.
+Run $NodeExe @((Join-Path $PSScriptRoot 'strip-links.mjs'), $Stage, '--check') $Stage
+Ok 'no links left in the tree'
 
 # ── 5. prove it serves, here, before anyone downloads it ────────────────────
 if (-not $SkipSmokeTest) {
