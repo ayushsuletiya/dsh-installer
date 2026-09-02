@@ -31,6 +31,11 @@ const PUBLIC_BASE = process.env.DIST_PUBLIC_BASE || "https://get.xovi.pro";
 const ADMIN_TOKEN = process.env.DIST_ADMIN_TOKEN || "";
 
 const PAYLOAD_DIR = path.join(ROOT, "payloads");
+const INSTALLER_DIR = path.join(ROOT, "installers");
+// The pristine, unstamped Windows installer. Every download is a copy of this file
+// with the machine's own base URL and token written into two fixed-width slots, so
+// nobody ever types or pastes a token.
+const WIN_EXE = path.join(INSTALLER_DIR, "DeepSeekHarness-Setup.exe");
 const REPORT_DIR = path.join(ROOT, "reports");
 const STATE_FILE = path.join(ROOT, "state.json");
 const LOG_FILE = process.env.DIST_LOG || path.join(ROOT, "dist.log");
@@ -250,12 +255,14 @@ function bootstrapPs1(token) {
 const HELP = `dsh-dist — managed DeepSeek Harness distribution
 
   install (macOS/Linux)   curl -fsSL ${PUBLIC_BASE}/i/<token> | bash
-  install (Windows)       irm ${PUBLIC_BASE}/w/<token> | iex
+  install (Windows)       ${PUBLIC_BASE}/x/<token>   <- download and double-click
+  install (Windows, old)  irm ${PUBLIC_BASE}/w/<token> | iex   (container, needs Docker)
   current release         ${PUBLIC_BASE}/manifest.json
 
 Enrollment tokens are issued by the operator. An enrolled machine fetches its own
 configuration over TLS at install time and on every update, so no credential file
-is ever copied by hand.
+is ever copied by hand. The Windows .exe carries its token inside the download, so
+there is nothing to paste at all.
 `;
 
 const WIN_CONTAINER_PS1 = [
@@ -705,6 +712,53 @@ function diagPs1(token) {
   return DIAG_PS1.split("__BASE__").join(PUBLIC_BASE).split("__TOKEN__").join(token);
 }
 
+// ---------- the Windows installer, personalised at download time ----------
+
+// The .exe carries two fixed-width slots: `DSHBASE=` and `DSHTOKEN=`, each followed
+// by a run of '0' padding. The value is written over the padding and terminated
+// with a NUL, so the binary's length never changes — a Go string's length lives
+// elsewhere in the image, and moving bytes around would corrupt it.
+//
+// NUL-terminated rather than padding-trimmed on purpose: a base64url token can
+// legitimately end in '0'.
+//
+// The slot is located by its padding run, not by the first match of the prefix: the
+// Go compiler also emits `DSHBASE=` on its own (the reader passes it as a literal)
+// and may share those bytes with the slot, so "first occurrence" is not the slot.
+const SLOT_MIN_PADDING = 32;
+
+function findSlot(buf, prefix) {
+  for (let at = buf.indexOf(prefix); at >= 0; at = buf.indexOf(prefix, at + 1)) {
+    const start = at + prefix.length;
+    let end = start;
+    while (end < buf.length && buf[end] === 0x30) end += 1;
+    if (end - start >= SLOT_MIN_PADDING) return { start, end };
+  }
+  return null;
+}
+
+function stampSlot(buf, prefix, value) {
+  const slot = findSlot(buf, prefix);
+  if (!slot) {
+    throw new Error(`installer has no unstamped ${prefix} slot (already stamped, or built without one)`);
+  }
+  const room = slot.end - slot.start;
+  const bytes = Buffer.from(String(value), "utf8");
+  if (bytes.length + 1 > room) {
+    throw new Error(`${prefix} value needs ${bytes.length + 1} bytes, slot holds ${room}`);
+  }
+  bytes.copy(buf, slot.start);
+  buf[slot.start + bytes.length] = 0x00;
+  buf.fill(0x30, slot.start + bytes.length + 1, slot.end);
+}
+
+function stampedInstaller(token) {
+  const buf = fs.readFileSync(WIN_EXE); // a fresh copy per download
+  stampSlot(buf, "DSHBASE=", PUBLIC_BASE);
+  stampSlot(buf, "DSHTOKEN=", token);
+  return buf;
+}
+
 // ---------- routes ----------
 
 const server = http.createServer(async (req, res) => {
@@ -726,19 +780,29 @@ const server = http.createServer(async (req, res) => {
 
     if (route === "/manifest.json" && req.method === "GET") {
       const rel = currentRelease();
-      if (!rel) return send(res, 503, { error: "no release published yet" });
+      // A service that has only ever published a Windows payload or an image is
+      // still a working service, so the legacy tarball track is optional here.
+      if (!rel && !state.image && !state.windows) {
+        return send(res, 503, { error: "no release published yet" });
+      }
       return send(res, 200, {
-        version: rel.version,
-        published: rel.published,
-        notes: rel.notes ?? "",
-        payload: {
-          url: `${PUBLIC_BASE}/payload/${rel.version}.tar.gz`,
-          sha256: rel.sha256,
-          sha256zip: rel.sha256zip ?? null,
-        },
+        version: rel?.version ?? null,
+        published: rel?.published ?? null,
+        notes: rel?.notes ?? "",
+        payload: rel
+          ? {
+              url: `${PUBLIC_BASE}/payload/${rel.version}.tar.gz`,
+              sha256: rel.sha256,
+              sha256zip: rel.sha256zip ?? null,
+            }
+          : null,
         // The container track. A client pulls this reference and never pins a tag
         // of its own, so publishing a new image is the whole update.
         image: state.image ?? null,
+        // The native Windows track: a pre-built tree with its own Node runtime,
+        // built and smoke-tested on a Windows runner. The .exe reads this to know
+        // what to download and what hash to insist on.
+        windows: state.windows ?? null,
       });
     }
 
@@ -751,6 +815,37 @@ const server = http.createServer(async (req, res) => {
       log("bootstrap", kind, token.slice(0, 8), req.headers["user-agent"] || "");
       const script = kind === "i" ? bootstrapSh(token) : bootstrapContainerPs1(token);
       return send(res, 200, script, { "content-type": "text/plain; charset=utf-8" });
+    }
+
+    // The Windows installer: one download, double-click, done. The token is stamped
+    // into the binary here, which is why there is no command to paste and nothing
+    // for the human to get wrong.
+    m = /^\/x\/([A-Za-z0-9_-]{8,64})(?:\.exe)?$/.exec(route);
+    if (m && req.method === "GET") {
+      const token = m[1];
+      if (!state.tokens[token]) return send(res, 404, "unknown or revoked enrollment token\n");
+      if (!fs.existsSync(WIN_EXE)) {
+        return send(res, 503, "no Windows installer has been published yet\n");
+      }
+      let exe;
+      try {
+        exe = stampedInstaller(token);
+      } catch (err) {
+        log("ERROR stamp", token.slice(0, 8), err.message);
+        return send(res, 500, `installer could not be prepared: ${err.message}\n`);
+      }
+      touchToken(token, { lastBootstrap: new Date().toISOString() });
+      log("installer exe", token.slice(0, 8), `${(exe.length / 1048576).toFixed(1)}MB`,
+        req.headers["user-agent"] || "");
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": exe.length,
+        // A filename Windows will show in the download bar, and no caching: the
+        // token is baked in, so a shared cache entry would be a credential leak.
+        "content-disposition": 'attachment; filename="DeepSeek Harness Setup.exe"',
+        "cache-control": "no-store, private",
+      });
+      return res.end(exe);
     }
 
     // A machine's own configuration. This is the whole point: keys travel over
@@ -853,7 +948,10 @@ const server = http.createServer(async (req, res) => {
           token,
           install: {
             macos: `curl -fsSL ${PUBLIC_BASE}/i/${token} | bash`,
-            windows: `irm ${PUBLIC_BASE}/w/${token} | iex`,
+            // The Windows answer is a link, not a command: it downloads an .exe with
+            // this machine's token already inside it.
+            windows: `${PUBLIC_BASE}/x/${token}`,
+            windows_container: `irm ${PUBLIC_BASE}/w/${token} | iex`,
           },
         });
       }
@@ -894,6 +992,57 @@ const server = http.createServer(async (req, res) => {
         saveState(state);
         log("image published", state.image.reference);
         return send(res, 200, state.image);
+      }
+
+      // Point the native Windows track at a payload. The zip lives wherever CI put
+      // it (a GitHub release asset today) because it is public, immutable and
+      // hash-checked by the installer — only the small stamped .exe has to come
+      // from here, since only it carries a token.
+      if (route === "/admin/windows" && req.method === "POST") {
+        const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+        for (const field of ["version", "url", "sha256"]) {
+          if (!body[field]) return send(res, 400, { error: `${field} required` });
+        }
+        if (!/^[0-9a-f]{64}$/i.test(String(body.sha256))) {
+          return send(res, 400, { error: "sha256 must be 64 hex characters" });
+        }
+        state.windows = {
+          version: String(body.version),
+          published: new Date().toISOString(),
+          notes: body.notes ? String(body.notes) : "",
+          payload: {
+            url: String(body.url),
+            sha256: String(body.sha256).toLowerCase(),
+            bytes: Number(body.bytes) || 0,
+          },
+        };
+        saveState(state);
+        log("windows published", state.windows.version, state.windows.payload.sha256.slice(0, 12));
+        return send(res, 200, state.windows);
+      }
+
+      // Upload the pristine installer .exe. Small enough to arrive as raw bytes,
+      // and it must be unstamped: every download stamps its own copy.
+      if (route === "/admin/winstaller" && req.method === "POST") {
+        const bytes = await readBody(req, 64 * 1024 * 1024);
+        if (bytes.length < 100 * 1024) return send(res, 400, { error: "that is not an installer" });
+        if (bytes.indexOf("DSHBASE=0") < 0 || bytes.indexOf("DSHTOKEN=0") < 0) {
+          return send(res, 400, {
+            error: "the installer is missing an unstamped DSHBASE=/DSHTOKEN= slot",
+          });
+        }
+        fs.mkdirSync(INSTALLER_DIR, { recursive: true });
+        fs.writeFileSync(WIN_EXE, bytes);
+        const sha = createHash("sha256").update(bytes).digest("hex");
+        state.installer = {
+          published: new Date().toISOString(),
+          bytes: bytes.length,
+          sha256: sha,
+          version: url.searchParams.get("version") || null,
+        };
+        saveState(state);
+        log("winstaller", `${(bytes.length / 1048576).toFixed(1)}MB`, sha.slice(0, 12));
+        return send(res, 200, state.installer);
       }
 
       // Publish: the tarball (and optional zip) arrive as raw bytes, metadata in

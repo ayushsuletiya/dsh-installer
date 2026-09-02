@@ -7,6 +7,10 @@
 #                                                   config every enrolled machine
 #                                                   receives
 #   ./tools/dsh-publish.sh --list                   who is enrolled, and the release
+#   ./tools/dsh-publish.sh --winstaller             build the Windows .exe here and
+#                                                   upload it (token is stamped in
+#                                                   per download, never typed)
+#   ./tools/dsh-publish.sh --windows V URL SHA BYTES point Windows at a CI payload
 #
 # Publishing packs this repository (minus .git) into a tarball, uploads it, and
 # points the manifest at it. Every enrolled machine notices within 6 hours, or
@@ -57,10 +61,54 @@ case "${1:-}" in
         for (const t of rows) {
           console.log(`  ${t.name}`);
           console.log(`    profile ${t.profile} · checked in ${t.checkIns ?? 0}x · last ${t.lastSeen ?? "never"}`);
-          console.log(`    curl -fsSL ${base}/i/${t.fullToken} | bash`);
+          console.log(`    macOS    curl -fsSL ${base}/i/${t.fullToken} | bash`);
+          console.log(`    Windows  ${base}/x/${t.fullToken}`);
         }
       });' < /tmp/dsh-enrollments.json
     rm -f /tmp/dsh-enrollments.json
+    ;;
+
+  # ── the Windows installer ───────────────────────────────────────────────────
+  # Cross-compiled here (pure Go, no Windows needed) and uploaded UNSTAMPED. The
+  # service writes each machine's base URL and token into the binary as it is
+  # served, which is why the Windows install is a link and not a command.
+  --winstaller)
+    command -v go >/dev/null 2>&1 || {
+      for candidate in "$HOME"/sdk/go*/go/bin; do
+        [ -x "$candidate/go" ] && PATH="$candidate:$PATH" && export PATH && break
+      done
+    }
+    command -v go >/dev/null 2>&1 || die "go is not installed (needed to build the .exe)"
+    OUT="$HERE/dist/DeepSeekHarness-Setup.exe"
+    mkdir -p "$HERE/dist"
+    ( cd "$HERE/win/installer" \
+      && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+           -ldflags "-H windowsgui -s -w" -o "$OUT" . ) \
+      || die "the installer did not build"
+    SIZE="$(node -e 'console.log((require("node:fs").statSync(process.argv[1]).size/1048576).toFixed(1))' "$OUT")"
+    ok "built $OUT (${SIZE} MB)"
+
+    scp -q -o BatchMode=yes "$OUT" "$VPS:/tmp/dsh-winstaller.exe"
+    ssh -o BatchMode=yes "$VPS" \
+      'TOK=$(cat /opt/dsh-dist/admin.token); curl -sS -X POST -H "Authorization: Bearer $TOK" --data-binary @/tmp/dsh-winstaller.exe "http://127.0.0.1:8790/admin/winstaller"; rm -f /tmp/dsh-winstaller.exe' \
+      | sed 's/^/  /'
+    ok "uploaded — every /x/<token> download is now this build"
+    ;;
+
+  --windows)
+    WVER="${2:?--windows needs a version}"
+    WURL="${3:?--windows needs the payload URL}"
+    WSHA="${4:?--windows needs the payload sha256}"
+    WBYTES="${5:-0}"
+    TMP="$(mktemp)"
+    node -e 'require("node:fs").writeFileSync(process.argv[5], JSON.stringify({version:process.argv[1],url:process.argv[2],sha256:process.argv[3],bytes:Number(process.argv[4])}))' \
+      "$WVER" "$WURL" "$WSHA" "$WBYTES" "$TMP"
+    scp -q -o BatchMode=yes "$TMP" "$VPS:/tmp/dsh-windows.json"
+    rm -f "$TMP"
+    ssh -o BatchMode=yes "$VPS" \
+      'TOK=$(cat /opt/dsh-dist/admin.token); curl -sS -X POST -H "Authorization: Bearer $TOK" -H "content-type: application/json" --data-binary @/tmp/dsh-windows.json http://127.0.0.1:8790/admin/windows; rm -f /tmp/dsh-windows.json' \
+      | sed 's/^/  /'
+    ok "Windows track now serves $WVER"
     ;;
 
   --enroll)
@@ -85,7 +133,7 @@ case "${1:-}" in
         console.log("  macOS / Linux — paste this on the new machine:");
         console.log("    " + d.install.macos);
         console.log("");
-        console.log("  Windows (PowerShell):");
+        console.log("  Windows — open this link and run the download:");
         console.log("    " + d.install.windows);
         console.log("");
       });' < "$HERE/.last-enroll.json"

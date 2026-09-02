@@ -9,3 +9,6 @@
 node_modules/
 .DS_Store
 .last-enroll.json
+
+# build output (the Windows payload is ~300 MB; it lives on a release, not in git)
+dist/
