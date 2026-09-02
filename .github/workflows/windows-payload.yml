@@ -1,0 +1,169 @@
+# Build the Windows harness on Windows, and prove it installs before anyone
+# downloads it.
+#
+# This job is the point of the whole exercise. Six Windows releases went out green
+# and dead because the only Windows machine in the loop was the user's. A runner
+# ends that: the payload is built here, the UI is loaded here, and the installer is
+# run here against a stand-in service — so a broken release fails in CI instead of
+# on his desk.
+name: Windows payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Payload version (also the release tag)
+        required: true
+        default: 3.0.0
+      dsh_version:
+        description: "@deepseek-ai/dsh version to bake in"
+        required: true
+        default: 0.1.1-rc.2
+      publish:
+        description: Attach the zip to a GitHub release
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - win/**
+      - payload/**
+      - tools/**
+      - .github/workflows/windows-payload.yml
+
+permissions:
+  contents: write # only to attach the payload to a release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ github.event.inputs.version || format('0.0.0-ci.{0}', github.run_number) }}
+      DSH_VERSION: ${{ github.event.inputs.dsh_version || '0.1.1-rc.2' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        shell: pwsh
+        run: |
+          "pwsh    $($PSVersionTable.PSVersion)"
+          "go      $(go version)"
+          "node    $(node --version)"
+          "git     $(git --version)"
+
+      # The slow one: a real npm install of dsh plus every plugin bundle, then the
+      # smoke test that loads the UI and walks each bundle the browser would fetch.
+      - name: Build the payload (and prove the UI serves)
+        id: payload
+        shell: pwsh
+        run: |
+          ./win/build-payload.ps1 -Version $env:VERSION -DshVersion $env:DSH_VERSION
+
+      - name: Build the installer
+        id: exe
+        shell: pwsh
+        run: |
+          Push-Location win/installer
+          $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
+          go vet ./...
+          go build -trimpath -ldflags "-H windowsgui -s -w" -o ../../dist/DeepSeekHarness-Setup.exe .
+          Pop-Location
+          $exe = Resolve-Path dist/DeepSeekHarness-Setup.exe
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          "installer: $exe ($mb MB)"
+          # An unstamped slot must be present, or get.xovi.pro cannot personalise it.
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($slot in @('DSHBASE=00000000', 'DSHTOKEN=00000000')) {
+            if ($text.IndexOf($slot) -lt 0) { throw "missing unstamped slot $slot" }
+          }
+          "both stamp slots present"
+
+      - name: The window must not crash
+        shell: pwsh
+        run: |
+          # Proves the Win32 code path (CreateWindowEx, the progress bar, the message
+          # pump) runs on a real desktop rather than only compiling.
+          $p = Start-Process dist/DeepSeekHarness-Setup.exe -ArgumentList '--selftest-ui' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "the UI self test exited $($p.ExitCode)" }
+          "window ok"
+
+      # The real thing: install from a stand-in service, with no credentials at all,
+      # and require the UI to answer afterwards.
+      - name: Install end to end
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Get-ChildItem dist/DeepSeekHarness-win-x64-*.zip | Select-Object -First 1).FullName
+          $sha = (Get-Content "$zip.sha256").Trim()
+          $svc = Start-Process node -ArgumentList @('win/ci-fake-service.mjs', $zip, $sha, '8799') -PassThru
+          try {
+            foreach ($i in 1..20) {
+              Start-Sleep -Milliseconds 500
+              try { Invoke-WebRequest http://127.0.0.1:8799/manifest.json -UseBasicParsing | Out-Null; break } catch {}
+            }
+            $root = Join-Path $env:RUNNER_TEMP 'dsh-e2e'
+            $p = Start-Process dist/DeepSeekHarness-Setup.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
+              '--silent', '--verbose',
+              '--base', 'http://127.0.0.1:8799',
+              '--token', 'citoken0',
+              '--root', $root
+            )
+            if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
+
+            # It reported success; now check what a browser would actually get.
+            node tools/verify-web.mjs --port 3080 --timeout 60
+            "installed and serving from $root"
+          } finally {
+            & dist/DeepSeekHarness-Setup.exe --uninstall --silent --root (Join-Path $env:RUNNER_TEMP 'dsh-e2e') 2>&1 | Out-Host
+            if ($svc -and -not $svc.HasExited) { Stop-Process -Id $svc.Id -Force -ErrorAction SilentlyContinue }
+            Get-Content (Join-Path $env:RUNNER_TEMP 'dsh-e2e\home\.dsh\logs\harness.log') -Tail 40 -ErrorAction SilentlyContinue |
+              ForEach-Object { "harness: $_" }
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.VERSION }}
+          retention-days: 14
+          path: |
+            dist/DeepSeekHarness-Setup.exe
+            dist/DeepSeekHarness-win-x64-*.zip
+            dist/DeepSeekHarness-win-x64-*.zip.sha256
+
+      # The zip is public, immutable and hash-checked by the installer, so a release
+      # asset is the right home for it: no 300 MB upload through the admin API, and
+      # no deploy key in CI.
+      - name: Publish the release
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = (Get-ChildItem dist/DeepSeekHarness-win-x64-*.zip | Select-Object -First 1).FullName
+          $sha = (Get-Content "$zip.sha256").Trim()
+          $tag = "win-$env:VERSION"
+          gh release create $tag $zip "$zip.sha256" dist/DeepSeekHarness-Setup.exe `
+            --title "Windows payload $env:VERSION" `
+            --notes "Built and smoke-tested on windows-latest.`n`nsha256 ``$sha``" `
+            --latest=false 2>&1 | Out-Host
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/" + (Split-Path -Leaf $zip)
+          $bytes = (Get-Item $zip).Length
+          ""
+          "Publish it to the service with:"
+          "  dsh-publish --windows $env:VERSION $url $sha $bytes"
+          @"
+### Windows payload ``$env:VERSION``
+
+| | |
+|---|---|
+| zip | ``$url`` |
+| sha256 | ``$sha`` |
+| bytes | $bytes |
+
+Publish to get.xovi.pro:
+``````
+dsh-publish --windows $env:VERSION $url $sha $bytes
+``````
+"@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
