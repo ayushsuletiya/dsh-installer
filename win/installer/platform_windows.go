@@ -84,11 +84,16 @@ func startService(cfg config) error {
 	return cmd.Start()
 }
 
-func stopService() {
+func stopService(cfg config) {
 	_ = runHidden("schtasks", "/End", "/TN", serveTask)
 	// Anything still holding the port is one of ours, identified by image path so a
-	// user's own node processes are never touched.
-	root := defaultRoot()
+	// user's own node processes are never touched. The CALLER's root, not the default
+	// one: an update or an uninstall against a non-default install would otherwise
+	// look in the wrong place and leave a live process holding the files.
+	root := cfg.root
+	if root == "" {
+		root = defaultRoot()
+	}
 	_, _ = runPS(fmt.Sprintf(
 		`Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '%s*' } | `+
 			`ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,

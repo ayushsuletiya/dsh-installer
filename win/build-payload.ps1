@@ -138,6 +138,19 @@ if (Test-Path -LiteralPath $workspace) {
   Run $NodeExe @((Join-Path $Inst 'tools\pnpm-allow-builds.mjs'), $workspace) $Stage
   Ok 'pnpm build allowances applied'
 }
+
+# A shippable tree must not contain symlinks. pnpm's default layout is a store of
+# symlinks into node_modules/.pnpm, and this tree gets zipped, moved and unzipped on
+# someone else's machine: a zip writer either follows those links and duplicates the
+# store, or preserves them and lands paths that resolve nowhere. Hoisted linking
+# produces one flat, real node_modules - which also keeps paths far away from
+# Windows' 260-character limit.
+@(
+  '# Shipped as a zip, so no symlinks and no store indirection.'
+  'node-linker=hoisted'
+  'symlink=false'
+) | Set-Content -LiteralPath (Join-Path $ProfileWeb '.npmrc') -Encoding UTF8
+Ok 'pnpm set to hoisted linking (no symlinks in the shipped tree)'
 Ok 'profile files in place'
 
 Step 'install plugin bundles (slow)'
@@ -211,6 +224,12 @@ if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
 $mb   = [math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 1)
 $hash | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii -NoNewline
+
+# A zip that swallowed a symlink loop is enormous rather than broken, so the size is
+# the cheapest tripwire: this payload is ~250-400 MB and anything far outside that
+# means the tree was not what we think it is.
+if ($mb -gt 900) { throw "the payload is $mb MB - something duplicated the dependency store" }
+if ($mb -lt 60)  { throw "the payload is only $mb MB - the profile did not install" }
 
 Write-Host ''
 Ok "$zip"

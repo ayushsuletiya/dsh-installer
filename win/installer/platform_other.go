@@ -24,7 +24,7 @@ func startService(cfg config) error {
 	return errors.New("the background service is Windows-only")
 }
 
-func stopService() {}
+func stopService(cfg config) {}
 
 func registerTasks(cfg config) error {
 	return errors.New("scheduled tasks are Windows-only")

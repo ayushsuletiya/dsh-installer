@@ -290,7 +290,7 @@ func fetchAndPlace(cfg config, man *manifest) error {
 		}
 	}
 
-	stopService()
+	stopService(cfg)
 	if fileExists(cfg.root) {
 		prev := cfg.root + ".old"
 		os.RemoveAll(prev)
@@ -397,7 +397,7 @@ func update(cfg config) error {
 
 func uninstall(cfg config) error {
 	ui.Stage("Removing", 20)
-	stopService()
+	stopService(cfg)
 	for _, t := range []string{serveTask, updateTask, qwenTask} {
 		_ = runHidden("schtasks", "/Delete", "/TN", t, "/F")
 	}
