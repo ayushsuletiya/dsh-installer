@@ -153,17 +153,20 @@ jobs:
           ""
           "Publish it to the service with:"
           "  dsh-publish --windows $env:VERSION $url $sha $bytes"
-          @"
-### Windows payload ``$env:VERSION``
-
-| | |
-|---|---|
-| zip | ``$url`` |
-| sha256 | ``$sha`` |
-| bytes | $bytes |
-
-Publish to get.xovi.pro:
-``````
-dsh-publish --windows $env:VERSION $url $sha $bytes
-``````
-"@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # An array of strings, not a here-string: a here-string's terminator has to
+          # sit at column 0, which breaks out of this YAML block scalar and makes the
+          # whole workflow file unparseable.
+          $summary = @(
+            "### Windows payload ``$env:VERSION``"
+            ""
+            "| | |"
+            "|---|---|"
+            "| zip | ``$url`` |"
+            "| sha256 | ``$sha`` |"
+            "| bytes | $bytes |"
+            ""
+            "Publish to get.xovi.pro:"
+            ""
+            "    dsh-publish --windows $env:VERSION $url $sha $bytes"
+          )
+          $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
