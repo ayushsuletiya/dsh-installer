@@ -26,6 +26,10 @@ on:
         description: Attach the zip to a GitHub release
         type: boolean
         default: true
+      reuse_run:
+        description: "Reuse the payload from this run id (skips the 28-minute build)"
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
@@ -44,6 +48,9 @@ env:
 jobs:
   # ── the slow half ───────────────────────────────────────────────────────────
   payload:
+    # Skipped when a previous run's artifact is being reused, which turns iteration on
+    # the installer from half an hour into about five minutes.
+    if: ${{ github.event.inputs.reuse_run == '' }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -98,6 +105,7 @@ jobs:
   install:
     runs-on: windows-latest
     needs: payload
+    if: ${{ always() && (needs.payload.result == 'success' || needs.payload.result == 'skipped') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +113,8 @@ jobs:
         with:
           name: windows-payload
           path: dist
+          run-id: ${{ github.event.inputs.reuse_run || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: The window must not crash
         timeout-minutes: 3
@@ -143,9 +153,17 @@ jobs:
           node win/stamp.mjs dist/DeepSeekHarness-Setup.exe $setup 'http://127.0.0.1:8799' 'citoken0'
           if ($LASTEXITCODE -ne 0) { throw 'could not stamp the installer' }
 
-          $p = Start-Process $setup -Wait -PassThru -NoNewWindow -ArgumentList @(
+          # -PassThru + WaitForExit, never -Wait: -Wait also waits on the process's
+          # descendants, and this installer deliberately leaves a long-lived
+          # background service behind. Build four installed perfectly, printed
+          # "Ready", and then sat here until the step timed out.
+          $p = Start-Process $setup -PassThru -NoNewWindow -ArgumentList @(
             '--silent', '--verbose', '--root', $root
           )
+          if (-not $p.WaitForExit(900000)) {
+            "the installer did not exit within 15 minutes"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
           $installExit = $p.ExitCode
           ""
           "installer exit code: $installExit"
@@ -214,12 +232,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: [payload, install]
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
+    if: ${{ always() && needs.install.result == 'success' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: windows-payload
           path: dist
+          run-id: ${{ github.event.inputs.reuse_run || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}

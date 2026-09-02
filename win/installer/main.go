@@ -253,7 +253,9 @@ func install(cfg config) error {
 	}
 
 	ui.Stage("Ready", 100)
-	openBrowser(fmt.Sprintf("http://127.0.0.1:%d", webPort))
+	if !cfg.silent {
+		openBrowser(fmt.Sprintf("http://127.0.0.1:%d", webPort))
+	}
 	ui.Done("Open \"" + appName + "\" from your Desktop any time.\n" +
 		"One thing left, once: sign into the Qwen app that just opened.")
 	return nil
@@ -344,7 +346,9 @@ func installSelf(cfg config) error {
 func open(cfg config) error {
 	url := fmt.Sprintf("http://127.0.0.1:%d", webPort)
 	if portOpen(webPort) {
-		openBrowser(url)
+		if !cfg.silent {
+			openBrowser(url)
+		}
 		return nil
 	}
 	ui.Stage("Starting the harness", 20)
@@ -354,7 +358,9 @@ func open(cfg config) error {
 	if !waitForPort(webPort, 120*time.Second) {
 		return errors.New("the harness is not answering. Open it again in a moment, or run --update")
 	}
-	openBrowser(url)
+	if !cfg.silent {
+		openBrowser(url)
+	}
 	ui.Done("")
 	return nil
 }
