@@ -71,6 +71,36 @@ jobs:
         shell: pwsh
         run: ./win/build-payload.ps1 -Version $env:VERSION -DshVersion $env:DSH_VERSION
 
+      # Uploaded BEFORE anything is tested: a failing test must still leave the
+      # 28-minute artifact behind, or the next attempt pays for it all over again.
+      # The zip ONLY - the installer is seconds to build and must always come from the
+      # commit under test, or a reuse_run would quietly exercise a stale one.
+      - name: Upload the payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            dist/DeepSeekHarness-win-x64-*.zip
+            dist/DeepSeekHarness-win-x64-*.zip.sha256
+
+  # ── the fast half ───────────────────────────────────────────────────────────
+  install:
+    runs-on: windows-latest
+    needs: payload
+    if: ${{ always() && (needs.payload.result == 'success' || needs.payload.result == 'skipped') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+          path: dist
+          run-id: ${{ github.event.inputs.reuse_run || github.run_id }}
+          github-token: ${{ github.token }}
+
+      # Always built here, from this commit.
       - name: Build the installer
         shell: pwsh
         run: |
@@ -87,34 +117,6 @@ jobs:
             if ($text.IndexOf($slot) -lt 0) { throw "missing unstamped slot $slot" }
           }
           "both stamp slots present"
-
-      # Uploaded BEFORE anything is tested: a failing test must still leave the
-      # 28-minute artifact behind, or the next attempt pays for it all over again.
-      - name: Upload the payload
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-payload
-          retention-days: 14
-          if-no-files-found: error
-          path: |
-            dist/DeepSeekHarness-Setup.exe
-            dist/DeepSeekHarness-win-x64-*.zip
-            dist/DeepSeekHarness-win-x64-*.zip.sha256
-
-  # ── the fast half ───────────────────────────────────────────────────────────
-  install:
-    runs-on: windows-latest
-    needs: payload
-    if: ${{ always() && (needs.payload.result == 'success' || needs.payload.result == 'skipped') }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-payload
-          path: dist
-          run-id: ${{ github.event.inputs.reuse_run || github.run_id }}
-          github-token: ${{ github.token }}
 
       - name: The window must not crash
         timeout-minutes: 3
@@ -256,6 +258,15 @@ jobs:
           if ($squat -and -not $squat.HasExited) { Stop-Process -Id $squat.Id -Force -ErrorAction SilentlyContinue }
           if ($installExit -ne 0) { exit 1 }
 
+      # Only ever the binary that just passed.
+      - name: Upload the tested installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          retention-days: 14
+          if-no-files-found: error
+          path: dist/DeepSeekHarness-Setup.exe
+
   # ── publish ─────────────────────────────────────────────────────────────────
   publish:
     runs-on: ubuntu-latest
@@ -264,10 +275,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-payload
+          name: windows-zip
           path: dist
           run-id: ${{ github.event.inputs.reuse_run || github.run_id }}
           github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: dist
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
