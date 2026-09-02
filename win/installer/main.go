@@ -114,6 +114,11 @@ func main() {
 		return
 	}
 
+	// The UI self test draws the window on a CI runner, where a modal dialog would
+	// wait forever for a click.
+	if mode == "selftest-ui" {
+		noDialogs = true
+	}
 	ui = newUI(cfg.silent, appName)
 	defer ui.Close()
 

@@ -263,6 +263,9 @@ func (u *winUI) Fail(text string) {
 	u.status = "Something went wrong"
 	u.mu.Unlock()
 	u.refresh()
+	if noDialogs {
+		return
+	}
 	// Owner 0 on purpose: this runs on the worker thread, and a modal dialog owned
 	// by another thread's window is how you deadlock a UI.
 	pMessageBoxW.Call(0,
@@ -273,7 +276,7 @@ func (u *winUI) Fail(text string) {
 
 func (u *winUI) Done(text string) {
 	u.Stage("Ready", 100)
-	if text != "" {
+	if text != "" && !noDialogs {
 		pMessageBoxW.Call(0,
 			uintptr(unsafe.Pointer(u16(text))),
 			uintptr(unsafe.Pointer(u16(u.title))),

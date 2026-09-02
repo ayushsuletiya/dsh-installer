@@ -6,6 +6,12 @@ import (
 	"sync"
 )
 
+// noDialogs suppresses the modal message boxes. A modal dialog waits for a human
+// to click OK, so anything unattended - CI, a scheduled update - must never raise
+// one: the process simply hangs until it is killed. This cost one CI run, stuck in
+// the UI self test with a dialog nobody could see.
+var noDialogs bool
+
 // progressUI is the whole surface the install logic is allowed to touch, so the
 // same code drives a native window, a console, or nothing at all.
 type progressUI interface {

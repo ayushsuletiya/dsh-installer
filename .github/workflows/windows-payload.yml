@@ -56,6 +56,7 @@ jobs:
       # smoke test that loads the UI and walks each bundle the browser would fetch.
       - name: Build the payload (and prove the UI serves)
         id: payload
+        timeout-minutes: 45
         shell: pwsh
         run: |
           ./win/build-payload.ps1 -Version $env:VERSION -DshVersion $env:DSH_VERSION
@@ -81,6 +82,7 @@ jobs:
           "both stamp slots present"
 
       - name: The window must not crash
+        timeout-minutes: 3
         shell: pwsh
         run: |
           # Proves the Win32 code path (CreateWindowEx, the progress bar, the message
@@ -92,6 +94,7 @@ jobs:
       # The real thing: install from a stand-in service, with no credentials at all,
       # and require the UI to answer afterwards.
       - name: Install end to end
+        timeout-minutes: 20
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
