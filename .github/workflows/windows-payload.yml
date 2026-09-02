@@ -153,6 +153,22 @@ jobs:
           node win/stamp.mjs dist/DeepSeekHarness-Setup.exe $setup 'http://127.0.0.1:8799' 'citoken0'
           if ($LASTEXITCODE -ne 0) { throw 'could not stamp the installer' }
 
+          # Ayush's Windows machine has had six earlier DSH attempts on it, and both
+          # older installers leave something holding 3080 - a "DSH Web" logon task or a
+          # restart:unless-stopped container. If the installer does not reclaim the
+          # port it reports Ready while the browser opens the OLD server, which is the
+          # worst failure available: a green install that is a lie. So plant a squatter
+          # that looks exactly like one (a node process serving 3080) and require the
+          # install to win the port anyway.
+          $squatCode = "require('http').createServer((q,s)=>s.end('OLD-HARNESS-SQUATTER')).listen(3080,'127.0.0.1')"
+          $squat = Start-Process node -ArgumentList @('-e', $squatCode) -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          try {
+            $probe = (Invoke-WebRequest http://127.0.0.1:3080 -UseBasicParsing -TimeoutSec 3).Content
+            if ($probe -notmatch 'SQUATTER') { throw "the squatter did not take port 3080" }
+            "squatter holding 3080 (pid $($squat.Id))"
+          } catch { "could not plant the squatter: $_" }
+
           # -PassThru + WaitForExit, never -Wait: -Wait also waits on the process's
           # descendants, and this installer deliberately leaves a long-lived
           # background service behind. Build four installed perfectly, printed
@@ -218,14 +234,26 @@ jobs:
           }
 
           if ($installExit -eq 0) {
+            # The squatter must be gone and OUR harness must be the one answering.
+            try {
+              $body = (Invoke-WebRequest http://127.0.0.1:3080 -UseBasicParsing -TimeoutSec 5).Content
+              if ($body -match 'SQUATTER') {
+                "FAIL: the old server is still serving 3080 - the installer reported success over a squatter"
+                $installExit = 90
+              } else { "port 3080 reclaimed from the previous installation" }
+            } catch { "could not read 3080 after install: $_"; $installExit = 91 }
+          }
+
+          if ($installExit -eq 0) {
             # It reported success; now check what a browser would actually get.
             node tools/verify-web.mjs --port 3080 --timeout 60
             if ($LASTEXITCODE -ne 0) { $installExit = $LASTEXITCODE; "verify-web failed" }
             else { "installed and serving from $root" }
           }
 
-          & dist/DeepSeekHarness-Setup.exe --uninstall --silent --root $root 2>&1 | Out-Host
+          & $setup --uninstall --silent --root $root 2>&1 | Out-Host
           if ($svc -and -not $svc.HasExited) { Stop-Process -Id $svc.Id -Force -ErrorAction SilentlyContinue }
+          if ($squat -and -not $squat.HasExited) { Stop-Process -Id $squat.Id -Force -ErrorAction SilentlyContinue }
           if ($installExit -ne 0) { exit 1 }
 
   # ── publish ─────────────────────────────────────────────────────────────────

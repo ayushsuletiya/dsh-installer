@@ -244,12 +244,22 @@ func install(cfg config) error {
 	}
 
 	ui.Stage("Starting the harness", 90)
+	// An earlier DSH on this machine - the native logon task or the container - would
+	// still be holding 3080. Left alone it makes this install a silent lie: the port
+	// answers, so we would report Ready while the browser opened the OLD server.
+	if err := reclaimPort(cfg); err != nil {
+		return err
+	}
 	if err := startService(cfg); err != nil {
 		return err
 	}
 	if !waitForPort(webPort, 150*time.Second) {
 		return fmt.Errorf("the harness did not answer on 127.0.0.1:%d — see %s",
 			webPort, filepath.Join(cfg.root, "home", ".dsh", "logs", "harness.log"))
+	}
+	if !servingOurs(cfg) {
+		return fmt.Errorf("port %d is answering, but from an older installation rather than this one. "+
+			"Restart Windows and run this again", webPort)
 	}
 
 	ui.Stage("Ready", 100)
@@ -398,6 +408,9 @@ func update(cfg config) error {
 		return err
 	}
 	_ = installSelf(cfg)
+	if err := reclaimPort(cfg); err != nil {
+		return err
+	}
 	if err := startService(cfg); err != nil {
 		return err
 	}

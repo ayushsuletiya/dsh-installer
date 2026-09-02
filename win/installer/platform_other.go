@@ -35,3 +35,7 @@ func makeShortcuts(cfg config) error { return errors.New("shortcuts are Windows-
 func removeShortcuts() {}
 
 func ensureQwen(cfg config) error { return errors.New("the Qwen desktop app is Windows-only") }
+
+func reclaimPort(cfg config) error { return nil }
+
+func servingOurs(cfg config) bool { return true }

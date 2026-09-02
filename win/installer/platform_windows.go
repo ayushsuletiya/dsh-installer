@@ -279,3 +279,104 @@ func qwenDownloadURL() (string, error) {
 	}
 	return "", errors.New("the Qwen config carried no Windows download URL")
 }
+
+// ── reclaiming the machine from an earlier DSH ───────────────────────────────
+// This machine has had six previous attempts on it: a native PowerShell install
+// that ran `dsh web` from a "DSH Web" logon task, and a container install that
+// published 3080 from a docker container with restart:unless-stopped. Either one
+// still holds port 3080 and would make this install a silent lie - waitForPort
+// would see the OLD server answer, the browser would open the OLD broken UI, and
+// the installer would print Ready.
+//
+// So: retire what earlier installers registered, then verify the thing answering
+// 3080 is actually the one we just installed.
+
+// Tasks earlier installers created. The Qwen and AgentRouter tasks are deliberately
+// NOT here: those serve 3083 and 3081, the new harness reuses them when they answer,
+// and killing them would remove working pieces.
+var legacyTasks = []string{"DSH Web", "DSH Update"}
+
+const legacyContainer = "deepseek-harness"
+
+// portListener returns the pid and image path of whatever is listening, or 0/"".
+func portListener(port int) (int, string) {
+	out, _ := runPS(fmt.Sprintf(
+		`$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+		 if ($c) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; "$($c.OwningProcess)|$($p.Path)" }`,
+		port))
+	parts := strings.SplitN(strings.TrimSpace(out), "|", 2)
+	if len(parts) != 2 {
+		return 0, ""
+	}
+	pid := 0
+	fmt.Sscanf(parts[0], "%d", &pid)
+	return pid, strings.TrimSpace(parts[1])
+}
+
+func underRoot(image, root string) bool {
+	if image == "" || root == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(image), strings.ToLower(root))
+}
+
+// reclaimPort clears an earlier DSH off the port. It refuses to kill a process it
+// cannot recognise: a stranger on 3080 is reported, not terminated.
+func reclaimPort(cfg config) error {
+	for _, task := range legacyTasks {
+		if err := runHidden("schtasks", "/Query", "/TN", task); err != nil {
+			continue // not registered on this machine
+		}
+		_ = runHidden("schtasks", "/End", "/TN", task)
+		if err := runHidden("schtasks", "/Delete", "/TN", task, "/F"); err == nil {
+			ui.Note("retired the old \"" + task + "\" task")
+		}
+	}
+
+	// The container track, if this machine ever ran it. Guarded on docker being
+	// present so a Docker-less machine pays nothing.
+	if _, err := exec.LookPath("docker"); err == nil {
+		if out, _ := runPS(fmt.Sprintf(
+			`$ErrorActionPreference='SilentlyContinue'; docker ps -a --filter name=^%s$ --format '{{.Names}}'`,
+			legacyContainer)); strings.Contains(out, legacyContainer) {
+			_, _ = runPS(fmt.Sprintf(`$ErrorActionPreference='SilentlyContinue'; docker rm -f %s | Out-Null`, legacyContainer))
+			ui.Note("removed the old " + legacyContainer + " container")
+		}
+	}
+
+	pid, image := portListener(webPort)
+	if pid == 0 || underRoot(image, cfg.root) {
+		return nil
+	}
+	// Recognisable as a harness: any dsh is node, and both earlier installs lived
+	// under .dsh or DeepSeekHarness.
+	lower := strings.ToLower(image)
+	known := strings.HasSuffix(lower, `\node.exe`) ||
+		strings.Contains(lower, `\.dsh`) ||
+		strings.Contains(lower, `deepseekharness`) ||
+		strings.Contains(lower, `com.docker`) ||
+		image == ""
+	if !known {
+		return fmt.Errorf("port %d is held by %s (pid %d). Close it and run this again",
+			webPort, filepath.Base(image), pid)
+	}
+	_, _ = runPS(fmt.Sprintf(`Stop-Process -Id %d -Force -ErrorAction SilentlyContinue`, pid))
+	for i := 0; i < 20 && portOpen(webPort); i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if portOpen(webPort) {
+		return fmt.Errorf("something is still holding port %d (pid %d)", webPort, pid)
+	}
+	ui.Note("freed port 3080 from the previous installation")
+	return nil
+}
+
+// servingOurs answers the question waitForPort cannot: is the server on 3080 the
+// one we just installed, or the old one that never worked?
+func servingOurs(cfg config) bool {
+	_, image := portListener(webPort)
+	if image == "" {
+		return true // cannot tell; do not invent a failure
+	}
+	return underRoot(image, cfg.root)
+}
