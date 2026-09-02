@@ -1,11 +1,14 @@
 # Build the Windows harness on Windows, and prove it installs before anyone
 # downloads it.
 #
-# This job is the point of the whole exercise. Six Windows releases went out green
-# and dead because the only Windows machine in the loop was the user's. A runner
-# ends that: the payload is built here, the UI is loaded here, and the installer is
-# run here against a stand-in service — so a broken release fails in CI instead of
-# on his desk.
+# Two jobs on purpose. Building the payload takes ~28 minutes (a real npm install of
+# dsh plus every plugin bundle); the installer around it is seconds. Keeping them in
+# one job meant every installer bug cost a full rebuild, so the payload is built once
+# and published as an artifact, and the install test is a separate fast job that
+# pulls it. Re-running only the failed job is then a ~4 minute loop.
+#
+# The point of all of it: six Windows releases went out green and dead because the
+# only Windows machine in the loop was the user's.
 name: Windows payload
 
 on:
@@ -34,13 +37,15 @@ on:
 permissions:
   contents: write # only to attach the payload to a release
 
+env:
+  VERSION: ${{ github.event.inputs.version || format('0.0.0-ci.{0}', github.run_number) }}
+  DSH_VERSION: ${{ github.event.inputs.dsh_version || '0.1.1-rc.2' }}
+
 jobs:
-  build:
+  # ── the slow half ───────────────────────────────────────────────────────────
+  payload:
     runs-on: windows-latest
-    timeout-minutes: 75
-    env:
-      VERSION: ${{ github.event.inputs.version || format('0.0.0-ci.{0}', github.run_number) }}
-      DSH_VERSION: ${{ github.event.inputs.dsh_version || '0.1.1-rc.2' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -52,17 +57,14 @@ jobs:
           "node    $(node --version)"
           "git     $(git --version)"
 
-      # The slow one: a real npm install of dsh plus every plugin bundle, then the
-      # smoke test that loads the UI and walks each bundle the browser would fetch.
-      - name: Build the payload (and prove the UI serves)
-        id: payload
+      # Includes the smoke test that loads the UI and walks every plugin bundle the
+      # browser would fetch, so a payload that cannot serve never gets packaged.
+      - name: Build the payload
         timeout-minutes: 45
         shell: pwsh
-        run: |
-          ./win/build-payload.ps1 -Version $env:VERSION -DshVersion $env:DSH_VERSION
+        run: ./win/build-payload.ps1 -Version $env:VERSION -DshVersion $env:DSH_VERSION
 
       - name: Build the installer
-        id: exe
         shell: pwsh
         run: |
           Push-Location win/installer
@@ -71,105 +73,179 @@ jobs:
           go build -trimpath -ldflags "-H windowsgui -s -w" -o ../../dist/DeepSeekHarness-Setup.exe .
           Pop-Location
           $exe = Resolve-Path dist/DeepSeekHarness-Setup.exe
-          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
-          "installer: $exe ($mb MB)"
+          "installer: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
           # An unstamped slot must be present, or get.xovi.pro cannot personalise it.
-          $bytes = [IO.File]::ReadAllBytes($exe)
-          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
           foreach ($slot in @('DSHBASE=00000000', 'DSHTOKEN=00000000')) {
             if ($text.IndexOf($slot) -lt 0) { throw "missing unstamped slot $slot" }
           }
           "both stamp slots present"
 
-      - name: The window must not crash
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          # Proves the Win32 code path (CreateWindowEx, the progress bar, the message
-          # pump) runs on a real desktop rather than only compiling.
-          $p = Start-Process dist/DeepSeekHarness-Setup.exe -ArgumentList '--selftest-ui' -PassThru -Wait
-          if ($p.ExitCode -ne 0) { throw "the UI self test exited $($p.ExitCode)" }
-          "window ok"
-
-      # The real thing: install from a stand-in service, with no credentials at all,
-      # and require the UI to answer afterwards.
-      - name: Install end to end
-        timeout-minutes: 20
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $zip = (Get-ChildItem dist/DeepSeekHarness-win-x64-*.zip | Select-Object -First 1).FullName
-          $sha = (Get-Content "$zip.sha256").Trim()
-          $svc = Start-Process node -ArgumentList @('win/ci-fake-service.mjs', $zip, $sha, '8799') -PassThru
-          try {
-            foreach ($i in 1..20) {
-              Start-Sleep -Milliseconds 500
-              try { Invoke-WebRequest http://127.0.0.1:8799/manifest.json -UseBasicParsing | Out-Null; break } catch {}
-            }
-            $root = Join-Path $env:RUNNER_TEMP 'dsh-e2e'
-            $p = Start-Process dist/DeepSeekHarness-Setup.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
-              '--silent', '--verbose',
-              '--base', 'http://127.0.0.1:8799',
-              '--token', 'citoken0',
-              '--root', $root
-            )
-            if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
-
-            # It reported success; now check what a browser would actually get.
-            node tools/verify-web.mjs --port 3080 --timeout 60
-            "installed and serving from $root"
-          } finally {
-            & dist/DeepSeekHarness-Setup.exe --uninstall --silent --root (Join-Path $env:RUNNER_TEMP 'dsh-e2e') 2>&1 | Out-Host
-            if ($svc -and -not $svc.HasExited) { Stop-Process -Id $svc.Id -Force -ErrorAction SilentlyContinue }
-            Get-Content (Join-Path $env:RUNNER_TEMP 'dsh-e2e\home\.dsh\logs\harness.log') -Tail 40 -ErrorAction SilentlyContinue |
-              ForEach-Object { "harness: $_" }
-          }
-
-      - name: Upload artifacts
+      # Uploaded BEFORE anything is tested: a failing test must still leave the
+      # 28-minute artifact behind, or the next attempt pays for it all over again.
+      - name: Upload the payload
         uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ env.VERSION }}
+          name: windows-payload
           retention-days: 14
+          if-no-files-found: error
           path: |
             dist/DeepSeekHarness-Setup.exe
             dist/DeepSeekHarness-win-x64-*.zip
             dist/DeepSeekHarness-win-x64-*.zip.sha256
 
-      # The zip is public, immutable and hash-checked by the installer, so a release
-      # asset is the right home for it: no 300 MB upload through the admin API, and
-      # no deploy key in CI.
-      - name: Publish the release
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
+  # ── the fast half ───────────────────────────────────────────────────────────
+  install:
+    runs-on: windows-latest
+    needs: payload
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-payload
+          path: dist
+
+      - name: The window must not crash
+        timeout-minutes: 3
         shell: pwsh
+        run: |
+          # Proves the Win32 path (CreateWindowEx, the progress bar, the message
+          # pump) runs on a real desktop rather than only compiling. Modal dialogs are
+          # suppressed in this mode; one that was not cost a whole cancelled run.
+          $p = Start-Process dist/DeepSeekHarness-Setup.exe -ArgumentList '--selftest-ui' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "the UI self test exited $($p.ExitCode)" }
+          "window ok"
+
+      - name: Install end to end
+        timeout-minutes: 22
+        shell: pwsh
+        run: |
+          # Continue, not Stop: this step's whole job is to finish and explain itself.
+          # A terminating error here once dropped pwsh into its debugger and sat at a
+          # prompt until the step timed out, hiding the very log that mattered.
+          $ErrorActionPreference = 'Continue'
+          $root = Join-Path $env:RUNNER_TEMP 'dsh-e2e'
+          $zip  = (Get-ChildItem dist/DeepSeekHarness-win-x64-*.zip | Select-Object -First 1).FullName
+          $sha  = (Get-Content "$zip.sha256").Trim()
+
+          $svc = Start-Process node -ArgumentList @('win/ci-fake-service.mjs', $zip, $sha, '8799') -PassThru
+          foreach ($i in 1..20) {
+            Start-Sleep -Milliseconds 500
+            try { Invoke-WebRequest http://127.0.0.1:8799/manifest.json -UseBasicParsing | Out-Null; break } catch {}
+          }
+
+          # Stamp the identity in, exactly as get.xovi.pro does when it serves the
+          # file, and then install with no --base/--token. Passing them as flags
+          # instead would leave the stamped path - the one every real download takes,
+          # and the one the scheduled task depends on - untested.
+          $setup = Join-Path $env:RUNNER_TEMP 'DeepSeekHarness-Setup-stamped.exe'
+          node win/stamp.mjs dist/DeepSeekHarness-Setup.exe $setup 'http://127.0.0.1:8799' 'citoken0'
+          if ($LASTEXITCODE -ne 0) { throw 'could not stamp the installer' }
+
+          $p = Start-Process $setup -Wait -PassThru -NoNewWindow -ArgumentList @(
+            '--silent', '--verbose', '--root', $root
+          )
+          $installExit = $p.ExitCode
+          ""
+          "installer exit code: $installExit"
+
+          $dshHome = Join-Path $root 'home\.dsh'
+          function Dump($label, $path, $tail) {
+            ""
+            "--- $label ---"
+            if (Test-Path -LiteralPath $path) {
+              Get-Content -LiteralPath $path -Tail $tail -ErrorAction SilentlyContinue
+            } else { "(no $path)" }
+          }
+          Dump 'harness.log'     (Join-Path $dshHome 'logs\harness.log') 120
+          Dump 'qwen-bridge.log' (Join-Path $dshHome 'logs\qwen-bridge.log') 40
+          ""
+          "--- installed tree ---"
+          foreach ($rel in @('runtime\node\node.exe', 'app\node_modules\@deepseek-ai\dsh\lib\bin.js',
+                             'bootstrap.mjs', 'version.txt', 'installer\payload',
+                             'baked\profiles\web\package.json', 'home\.dsh\settings.yaml')) {
+            $state = 'MISSING'
+            if (Test-Path -LiteralPath (Join-Path $root $rel)) { $state = 'present' }
+            "{0,-52} {1}" -f $rel, $state
+          }
+          ""
+          "--- scheduled task ---"
+          schtasks /Query /TN "DeepSeek Harness" /FO LIST 2>&1 | Select-Object -First 6
+
+          # When the service path fails, find out whether the harness itself is fine by
+          # running it in the foreground. That one fact separates "my plumbing is
+          # wrong" from "the payload is broken", and saves a whole guessing round.
+          if ($installExit -ne 0) {
+            ""
+            "--- foreground attempt (classifies the failure) ---"
+            $env:DSH_HOME = $dshHome
+            $env:DSH_NO_QWEN_BRIDGE = '1'
+            $fgOut = Join-Path $env:RUNNER_TEMP 'fg.out.log'
+            $fgErr = Join-Path $env:RUNNER_TEMP 'fg.err.log'
+            $fg = Start-Process (Join-Path $root 'runtime\node\node.exe') `
+              -ArgumentList @((Join-Path $root 'bootstrap.mjs'), '--no-supervise') `
+              -WorkingDirectory $root -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput $fgOut -RedirectStandardError $fgErr
+            $up = $false
+            foreach ($i in 1..45) {
+              Start-Sleep -Seconds 2
+              try { Invoke-WebRequest http://127.0.0.1:3080 -TimeoutSec 2 -UseBasicParsing | Out-Null; $up = $true; break } catch {}
+            }
+            if ($up) { "VERDICT: the harness SERVES in the foreground - the fault is in the service plumbing" }
+            else     { "VERDICT: the harness does NOT serve in the foreground either - the fault is in the payload" }
+            Dump 'foreground stdout' $fgOut 40
+            Dump 'foreground stderr' $fgErr 40
+            if ($fg -and -not $fg.HasExited) { Stop-Process -Id $fg.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+          if ($installExit -eq 0) {
+            # It reported success; now check what a browser would actually get.
+            node tools/verify-web.mjs --port 3080 --timeout 60
+            if ($LASTEXITCODE -ne 0) { $installExit = $LASTEXITCODE; "verify-web failed" }
+            else { "installed and serving from $root" }
+          }
+
+          & dist/DeepSeekHarness-Setup.exe --uninstall --silent --root $root 2>&1 | Out-Host
+          if ($svc -and -not $svc.HasExited) { Stop-Process -Id $svc.Id -Force -ErrorAction SilentlyContinue }
+          if ($installExit -ne 0) { exit 1 }
+
+  # ── publish ─────────────────────────────────────────────────────────────────
+  publish:
+    runs-on: ubuntu-latest
+    needs: [payload, install]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-payload
+          path: dist
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          $zip = (Get-ChildItem dist/DeepSeekHarness-win-x64-*.zip | Select-Object -First 1).FullName
-          $sha = (Get-Content "$zip.sha256").Trim()
-          $tag = "win-$env:VERSION"
-          gh release create $tag $zip "$zip.sha256" dist/DeepSeekHarness-Setup.exe `
-            --title "Windows payload $env:VERSION" `
-            --notes "Built and smoke-tested on windows-latest.`n`nsha256 ``$sha``" `
-            --latest=false 2>&1 | Out-Host
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/" + (Split-Path -Leaf $zip)
-          $bytes = (Get-Item $zip).Length
-          ""
-          "Publish it to the service with:"
-          "  dsh-publish --windows $env:VERSION $url $sha $bytes"
-          # An array of strings, not a here-string: a here-string's terminator has to
-          # sit at column 0, which breaks out of this YAML block scalar and makes the
-          # whole workflow file unparseable.
-          $summary = @(
-            "### Windows payload ``$env:VERSION``"
-            ""
-            "| | |"
-            "|---|---|"
-            "| zip | ``$url`` |"
-            "| sha256 | ``$sha`` |"
-            "| bytes | $bytes |"
-            ""
-            "Publish to get.xovi.pro:"
-            ""
-            "    dsh-publish --windows $env:VERSION $url $sha $bytes"
-          )
-          $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          set -eu
+          zip=$(ls dist/DeepSeekHarness-win-x64-*.zip | head -1)
+          sha=$(cat "$zip.sha256")
+          bytes=$(stat -c%s "$zip")
+          tag="win-$VERSION"
+          gh release create "$tag" "$zip" "$zip.sha256" dist/DeepSeekHarness-Setup.exe \
+            --repo "$REPO" \
+            --title "Windows payload $VERSION" \
+            --notes "Built and smoke-tested on windows-latest. sha256 \`$sha\`" \
+            --latest=false
+          url="https://github.com/$REPO/releases/download/$tag/$(basename "$zip")"
+          {
+            echo "### Windows payload \`$VERSION\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| zip | \`$url\` |"
+            echo "| sha256 | \`$sha\` |"
+            echo "| bytes | $bytes |"
+            echo
+            echo "Publish to get.xovi.pro:"
+            echo
+            echo "    dsh-publish --windows $VERSION $url $sha $bytes"
+          } >> "$GITHUB_STEP_SUMMARY"

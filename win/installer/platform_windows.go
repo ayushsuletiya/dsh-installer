@@ -78,10 +78,31 @@ func startService(cfg config) error {
 			return err
 		}
 	}
-	cmd := exec.Command(exe, "--serve")
+	cmd := exec.Command(exe, serveArgs(cfg)...)
 	cmd.Dir = cfg.root
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: detachedProcess}
 	return cmd.Start()
+}
+
+// serveArgs carries THIS install's identity to the background process.
+//
+// Without --root the child recomputes the DEFAULT install location and goes looking
+// for bootstrap.mjs somewhere else entirely - which is exactly why the end-to-end
+// test failed at "Starting the harness": the scheduled task and the detached
+// fallback were both started with no idea where they had been installed.
+//
+// --base and --token are only added when they did NOT come from the binary's own
+// stamped slots, so a real download never repeats its token on a command line where
+// schtasks /Query would show it.
+func serveArgs(cfg config) []string {
+	args := []string{"--serve", "--root", cfg.root}
+	if unslot(baseSlot, "DSHBASE=") == "" && cfg.base != "" && cfg.base != fallback {
+		args = append(args, "--base", cfg.base)
+	}
+	if unslot(tokenSlot, "DSHTOKEN=") == "" && cfg.token != "" {
+		args = append(args, "--token", cfg.token)
+	}
+	return args
 }
 
 func stopService(cfg config) {
@@ -105,17 +126,27 @@ func stopService(cfg config) {
 
 func registerTasks(cfg config) error {
 	exe := filepath.Join(cfg.root, exeName)
-	quoted := func(mode string) string { return `"` + exe + `" ` + mode }
+	quoted := func(args ...string) string {
+		out := `"` + exe + `"`
+		for _, a := range args {
+			if strings.ContainsAny(a, " \t") {
+				out += ` "` + a + `"`
+			} else {
+				out += " " + a
+			}
+		}
+		return out
+	}
 
 	if err := runHidden("schtasks", "/Create", "/TN", serveTask,
-		"/TR", quoted("--serve"), "/SC", "ONLOGON", "/RL", "LIMITED", "/F"); err != nil {
+		"/TR", quoted(serveArgs(cfg)...), "/SC", "ONLOGON", "/RL", "LIMITED", "/F"); err != nil {
 		return err
 	}
 	// Every six hours, and once thirty minutes from now so the first check does not
 	// wait for the next logon.
 	start := time.Now().Add(30 * time.Minute).Format("15:04")
 	if err := runHidden("schtasks", "/Create", "/TN", updateTask,
-		"/TR", quoted("--update --silent"), "/SC", "HOURLY", "/MO", "6",
+		"/TR", quoted("--update", "--silent", "--root", cfg.root), "/SC", "HOURLY", "/MO", "6",
 		"/ST", start, "/RL", "LIMITED", "/F"); err != nil {
 		return err
 	}
